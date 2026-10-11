@@ -1,0 +1,9 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+
+# Tooling caches
+.ruff_cache/
+
+# Virtual environments
+.venv
