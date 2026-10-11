@@ -16,7 +16,7 @@ install folders.
 
 Run it with uv (it pulls in `rich` automatically):
 
-    uv run fuse.py --aligner all -s /photos/stack/export -o /photos/stack/fuse
+    uv run fuse.py --aligner all -i /photos/stack/export -o /photos/stack/fuse
 
 Layout of the output folder
 ---------------------------
@@ -801,10 +801,12 @@ def main() -> int:
         help="manual engine: 'low' for a steady tripod (default: high)",
     )
     ap.add_argument(
-        "-s",
-        "--source",
+        "-i",
+        "--input",
+        dest="source",
+        metavar="INPUT",
         default=None,
-        help="folder with the source frames (default: current folder)",
+        help="folder with the input frames (default: current folder)",
     )
     ap.add_argument(
         "-o",

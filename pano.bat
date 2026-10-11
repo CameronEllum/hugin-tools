@@ -4,7 +4,7 @@ rem  pano.bat - run Pano (pano.py) on Windows via uv.
 rem
 rem  Run it from the folder that holds your panorama jpgs, e.g.:
 rem      pano.bat                  (results in this folder)
-rem      pano.bat -s "D:\path\row" -o "D:\path\result"
+rem      pano.bat -i "D:\path\row" -o "D:\path\result"
 rem      pano.bat -d               (verbose logging)
 rem
 rem  All arguments are passed straight through to pano.py.

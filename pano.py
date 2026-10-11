@@ -16,7 +16,7 @@ Mirrors the manual Hugin GUI workflow:
      5. geometric optimisation of positions, starting from the anchor
      6. remove residuals (per-point pano-space distance above --threshold)
      7. optimise positions again
-     8. center + autocrop (preview: center, fit, crop)
+     8. center yaw, aim the view vertically (the "drag"), then autocrop
      9. calculate optimal canvas size
     10. stitch
 
@@ -25,7 +25,7 @@ in the Hugin GUI and inspected.
 
 Run it with uv (it pulls in `rich` automatically):
 
-    uv run pano.py -s /photos/pano-row -o /photos/pano-row
+    uv run pano.py -i /photos/pano-row -o /photos/pano-row
 
 Notes / known gaps (this is a start, not a drop-in for every pano):
   - the anchor is implemented by ordering: the middle frame is listed first in
@@ -498,6 +498,20 @@ def _parse_c_line(text: str) -> dict | None:
 
 _FLOAT_RE = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
 
+_YP_RE = re.compile(rb"(?:^|\s)([yp])(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)(?=\s|$)")
+
+
+def mean_pitch(pto: Path) -> float:
+    """Mean pitch (degrees) of the images in a Hugin project file."""
+    pitches: list[float] = []
+    for line in Path(pto).read_bytes().split(b"\n"):
+        if not line.startswith(b"i "):
+            continue
+        for match in _YP_RE.finditer(line.split(b' n"', 1)[0]):
+            if match.group(1) == b"p":
+                pitches.append(float(match.group(2)))
+    return sum(pitches) / len(pitches) if pitches else 0.0
+
 
 def filter_residuals(tools: dict, src_pto: Path, dst_pto: Path, threshold: float) -> str:
     """Drop control points whose pano-space distance is above threshold.
@@ -629,7 +643,6 @@ def build_plan(
     # LDR output type for the stitch; JPG gets an explicit quality to match Fuse.
     fmt = args.format.upper()
     ldr = ["--ldr-file=" + fmt] + (["--ldr-compression=95"] if fmt == "JPG" else [])
-    center = ["--center"] if args.center else []
     anchor_frame, final_frame = frames[0], frames[-1]
 
     def checkpoint(label: str, path: Path, build) -> Step:
@@ -752,64 +765,16 @@ def build_plan(
             ),
         )
     )
-    def center_tmp_view() -> str | None:
-        # Rigidly rotate the whole assembly so the image cluster centers on
-        # yaw=0, pitch=0 -- the scripted equivalent of dragging the viewpoint
-        # to the middle of the images in the GL preview. (pano_modify --center
-        # only centers yaw; pitch must be handled here.) Pairwise alignment is
-        # untouched: every image gets the same delta. Byte-level edit, so
-        # non-ASCII paths pass through unchanged.
-        yp = re.compile(rb"(?:^|\s)([yp])(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)(?=\s|$)")
-        raw = straighten_tmp.read_bytes()
-        yaws: list[float] = []
-        pitches: list[float] = []
-        for ln in raw.split(b"\n"):
-            if not ln.startswith(b"i "):
-                continue
-            vals: dict[bytes, float] = {}
-            for m in yp.finditer(ln):
-                vals[m.group(1)] = float(m.group(2))
-            if b"y" not in vals or b"p" not in vals:
-                raise RuntimeError(f"Cannot read yaw/pitch in {straighten_tmp.name}")
-            yaws.append(vals[b"y"])
-            pitches.append(vals[b"p"])
-        n = len(yaws)
-        if n == 0:
-            raise RuntimeError(f"No images found in {straighten_tmp.name}")
-        ym = math.degrees(
-            math.atan2(
-                sum(math.sin(math.radians(v)) for v in yaws) / n,
-                sum(math.cos(math.radians(v)) for v in yaws) / n,
-            )
-        )
-        pm = sum(pitches) / n
-        if abs(ym) < 0.005 and abs(pm) < 0.005:
-            return None
-        out: list[bytes] = []
-        for ln in raw.split(b"\n"):
-            if ln.startswith(b"i "):
-                pos = 0
-                new_ln = b""
-                for m in yp.finditer(ln):
-                    key = m.group(1)
-                    val = float(m.group(2))
-                    new = val - (ym if key == b"y" else pm)
-                    if key == b"y":
-                        new = (new + 180.0) % 360.0 - 180.0
-                    new_ln += ln[pos : m.start(2)] + repr(new).encode("ascii")
-                    pos = m.end(2)
-                new_ln += ln[pos:]
-                ln = new_ln
-            out.append(ln)
-        straighten_tmp.write_bytes(b"\n".join(out))
-        return f"Centered {n} images (yaw {ym:+.1f}°, pitch {pm:+.1f}°)"
-
+    # Yaw centering is unconditional: pano_modify --center is CentreHorizontally
+    # (RotatePanorama(-dYaw, 0, 0)), which centres the horizontal extent on
+    # yaw=0 and leaves pitch alone. Projection is set here so the following
+    # fit-field-of-view uses the final projection.
     need08 = args.force or not (outdir / "08_preview.pto").exists()
     straighten_tmp = outdir / "08_straight_tmp.pto"
+    yaw_tmp = outdir / "08a_yaw.pto"
     if args.straighten and need08:
-        # Straighten in its own call first: center/crop must be computed on
-        # the already-leveled geometry, which a single combined call does
-        # not guarantee.
+        # Straighten first: centring/crop must run on the already-levelled
+        # geometry, which a single combined call does not guarantee.
         steps.append(
             Step(
                 "Straightening",
@@ -827,26 +792,42 @@ def build_plan(
         straighten_tmp.unlink(missing_ok=True)
         return None
 
-    center_src = straighten_tmp if (args.straighten and need08) else outdir / "07_geometry2.pto"
+    yaw_src = straighten_tmp if (args.straighten and need08) else outdir / "07_geometry2.pto"
     steps.append(
-        checkpoint(
-            "Centering and cropping",
-            outdir / "08_preview.pto",
-            lambda dst: Step(
-                "Centering and cropping",
-                [
-                    tools["pano_modify"],
-                    "-o",
-                    str(dst),
-                    *center,
-                    "--crop=AUTO",
-                    f"--projection={proj}",
-                    str(center_src),
-                ],
-                on_done=cleanup_tmp if (args.straighten and need08) else None,
-            ),
+        Step(
+            "Centering (yaw)",
+            [
+                tools["pano_modify"],
+                "-o",
+                str(yaw_tmp),
+                "--center",
+                f"--projection={proj}",
+                str(yaw_src),
+            ],
+            on_done=cleanup_tmp if (args.straighten and need08) else None,
+            outputs=[yaw_tmp],
         )
+        if need08
+        else Step("Centering (yaw)", note="Exists: 08_preview.pto - skipping")
     )
+
+    # Final aim: the scripted equivalent of dragging the view up/down in Hugin's
+    # GL preview. pano_modify --center only centres yaw, so the images' mean
+    # pitch is removed here with an explicit rotation (pano_modify applies
+    # --rotate before --crop). Crop and projection always run.
+    def center_step(dst: Path) -> Step:
+        def cmd() -> list[str]:
+            argv = [tools["pano_modify"], "-o", str(dst)]
+            if args.center:
+                pm = mean_pitch(yaw_tmp)
+                if abs(pm) > 0.005:
+                    argv += ["--rotate", f"0,{-pm:.5f},0"]
+            argv += ["--crop=AUTO", f"--projection={proj}", str(yaw_tmp)]
+            return argv
+
+        return Step("Centering and cropping", cmd_fn=cmd)
+
+    steps.append(checkpoint("Centering and cropping", outdir / "08_preview.pto", center_step))
 
     # Step 9 sets the canvas and the output file type.
     def size_step(dst: Path) -> Step:
@@ -1171,10 +1152,12 @@ def main() -> int:
         formatter_class=_HELP_FORMATTER,
     )
     ap.add_argument(
-        "-s",
-        "--source",
+        "-i",
+        "--input",
+        dest="source",
+        metavar="INPUT",
         default=None,
-        help="folder with the source jpgs (default: current folder)",
+        help="folder with the input jpgs (default: current folder)",
     )
     ap.add_argument(
         "-o",
@@ -1199,6 +1182,7 @@ def main() -> int:
     )
     ap.set_defaults(line_count=5)
     ap.add_argument(
+        "-s",
         "--straighten",
         "--no-straighten",
         dest="straighten",
@@ -1215,7 +1199,7 @@ def main() -> int:
         action=Toggle,
         off=["--no-center"],
         default=True,
-        help="center the panorama on the images (default: on)",
+        help="aim the view vertically on the images - the scripted 'drag' in Hugin (default: on)",
     )
     ap.add_argument(
         "--prefix",

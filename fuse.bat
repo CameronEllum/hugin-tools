@@ -6,7 +6,7 @@ rem  Run it from the folder that holds your images, e.g.:
 rem      fuse.bat                  (default ais aligner, results in this folder)
 rem      fuse.bat --aligner all    (run manual and ais into sub-folders)
 rem      fuse.bat -d               (keep everything + verbose logging)
-rem      fuse.bat -s "D:\path\export" -o "D:\path\out"
+rem      fuse.bat -i "D:\path\export" -o "D:\path\out"
 rem
 rem  All arguments are passed straight through to fuse.py.
 rem ============================================================================
