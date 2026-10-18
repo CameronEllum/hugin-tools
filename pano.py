@@ -925,6 +925,18 @@ def build_plan(
 # ---------------------------------------------------------------------------
 #  Executing the plan
 # ---------------------------------------------------------------------------
+def _failure_tail(lines: list[str], keep: int = 6) -> str:
+    """The last few lines a tool printed, for a failure message.
+
+    A bare exit code says nothing about why a command failed, and these tools
+    put the reason on their last lines.
+    """
+    tail = [line.strip() for line in lines if line.strip()][-keep:]
+    if not tail:
+        return ""
+    return "\n" + "\n".join(f"    {line}" for line in tail)
+
+
 def execute_step(ui: UI, step: Step, console=None) -> float:
     """Run one step's command. Returns elapsed seconds. Raises on failure."""
     argv = step.cmd_fn() if step.cmd_fn is not None else step.cmd
@@ -950,7 +962,7 @@ def execute_step(ui: UI, step: Step, console=None) -> float:
             if ui.verbose:
                 ui.dim(line, console)
         if proc.wait() != 0:
-            raise RuntimeError(f"{step.label} failed (exit {proc.returncode})")
+            raise RuntimeError(f"{step.label} failed (exit {proc.returncode}){_failure_tail(buf)}")
     except KeyboardInterrupt:
         proc.kill()
         proc.wait()

@@ -16,7 +16,14 @@ install folders.
 
 Run it with uv (it pulls in `rich` automatically):
 
-    uv run fuse.py --aligner all -i /photos/stack/export -o /photos/stack/fuse
+    uv run fuse.py                      # every image in this folder
+    uv run fuse.py PXL_*.jpg            # only these - cmd.exe hands the pattern
+    uv run fuse.py -i /photos/export -o /photos/fuse --aligner all
+
+Inputs are whatever you name: image files, glob patterns, or a folder (a folder
+is read as before).  `-i/--input` takes the same.  With no names at all, the
+current folder is used.  Note that cmd.exe does not expand wildcards, so the
+pattern arrives here intact and is expanded by fuse.py itself.
 
 Layout of the output folder
 ---------------------------
@@ -72,6 +79,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import glob
 import os
 import re
 import shutil
@@ -196,7 +204,7 @@ class UI:
         self,
         title: str,
         count: int,
-        source: Path,
+        source: Path | str,
         frames: list[Path],
         extra: list[str] | None = None,
     ) -> None:
@@ -307,30 +315,53 @@ def resolve_tools() -> dict:
 IMAGE_EXTS = {".jpg", ".jpeg", ".tif", ".tiff", ".png"}
 
 
-def collect_frames(source: Path) -> tuple[list[Path], list[Path]]:
-    """Top-level images in a folder, sorted by name (chronological).
+def is_image(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in IMAGE_EXTS
 
-    Returns (frames, skipped) without printing, so the caller can show the
-    program header first and the operation metadata afterwards.
+
+def is_our_output(path: Path) -> bool:
+    """Our own results (…_fuse_…, and legacy …_MFNR_…) are never input frames."""
+    return "_fuse" in path.stem or "_MFNR" in path.stem
+
+
+def collect_frames(specs: list[str]) -> tuple[list[Path], list[Path], list[str]]:
+    """Frames to fuse, from folders, files or glob patterns.
+
+    Whatever the shell hands over: a folder is read as before, a pattern the
+    shell did not expand is expanded here (cmd.exe leaves wildcards alone, unlike
+    PowerShell), and explicit files are taken as given.  Returns
+    (frames, skipped, unmatched) - skipped are previous Fuse outputs, unmatched
+    are names that matched nothing or are not images, so the caller can say so
+    rather than quietly use fewer frames.
     """
-    if not source.is_dir():
-        raise SystemExit(f"Source folder not found: {source}")
-
-    frames, skipped = [], []
-    for p in source.iterdir():
-        if not p.is_file() or p.suffix.lower() not in IMAGE_EXTS:
-            continue
-        # Skip our own outputs (…_fuse_*.jpg, and legacy …_MFNR_*.jpg) so a
-        # re-run in the same folder never re-ingests them.
-        if "_fuse" in p.stem or "_MFNR" in p.stem:
-            skipped.append(p)
+    frames: list[Path] = []
+    skipped: list[Path] = []
+    unmatched: list[str] = []
+    for spec in specs:
+        text = str(spec)
+        path = Path(text)
+        if path.is_dir():
+            found = [p for p in sorted(path.iterdir()) if is_image(p)]
+        elif glob.has_magic(text):
+            found = [Path(m) for m in sorted(glob.glob(text, recursive=True)) if is_image(Path(m))]
+        elif is_image(path):
+            found = [path]
         else:
-            frames.append(p)
-    frames.sort(key=lambda p: p.name)
+            found = []
+        if not found:
+            unmatched.append(text)
+        for p in found:
+            (skipped if is_our_output(p) else frames).append(p.resolve())
 
+    frames = sorted(dict.fromkeys(frames), key=lambda p: p.name)
     if not frames:
-        raise SystemExit(f"No source frames ({', '.join(sorted(IMAGE_EXTS))}) found in: {source}")
-    return frames, skipped
+        raise SystemExit(
+            "No source frames found in: "
+            + ", ".join(specs)
+            + "\nName image files, a glob pattern, or a folder holding them"
+            f" ({', '.join(sorted(IMAGE_EXTS))})."
+        )
+    return frames, skipped, unmatched
 
 
 # ---------------------------------------------------------------------------
@@ -1099,6 +1130,19 @@ def step_icon(label: str) -> str:
     return "•"
 
 
+def _failure_tail(lines: list[str], keep: int = 6) -> str:
+    """The last few lines a tool printed, for a failure message.
+
+    A bare exit code says nothing about why a command failed, and these tools
+    put the reason on their last lines - 'No active images in ROI' instead of a
+    silent stop, for instance.
+    """
+    tail = [line.strip() for line in lines if line.strip()][-keep:]
+    if not tail:
+        return ""
+    return "\n" + "\n".join(f"    {line}" for line in tail)
+
+
 def execute_step(ui: UI, step: Step, console=None) -> tuple[float, str | None]:
     """Run one step's command or Python callable.
 
@@ -1131,7 +1175,7 @@ def execute_step(ui: UI, step: Step, console=None) -> tuple[float, str | None]:
             if ui.verbose:
                 ui.dim(line, console)
         if proc.wait() != 0:
-            raise RuntimeError(f"{step.label} failed (exit {proc.returncode})")
+            raise RuntimeError(f"{step.label} failed (exit {proc.returncode}){_failure_tail(buf)}")
     except KeyboardInterrupt:
         proc.kill()
         proc.wait()
@@ -1328,12 +1372,18 @@ def main() -> int:
         help="manual engine: 'low' for a steady tripod (default: high)",
     )
     ap.add_argument(
+        "images",
+        nargs="*",
+        metavar="IMAGE",
+        help="frames to fuse: image files, glob patterns, or a folder (default: this folder)",
+    )
+    ap.add_argument(
         "-i",
         "--input",
         dest="source",
         metavar="INPUT",
         default=None,
-        help="folder with the input frames (default: current folder)",
+        help="frames to fuse, as with IMAGE above (default: the current folder)",
     )
     ap.add_argument(
         "-o",
@@ -1532,10 +1582,10 @@ def main() -> int:
     run_start = time.time()
     try:
         tools = resolve_tools()
-        source = Path(args.source) if args.source else Path.cwd()
         outdir = Path(args.outdir) if args.outdir else Path(".")
+        specs = [*args.images, *([args.source] if args.source else [])] or [str(Path.cwd())]
 
-        frames, skipped = collect_frames(source)
+        frames, skipped, unmatched = collect_frames(specs)
 
         # ais aligns in place and cannot pad or rescale, so a stack of mixed
         # sizes would die deep inside align_image_stack - refuse it up front.
@@ -1549,8 +1599,26 @@ def main() -> int:
             extra.append(
                 f"[yellow]Ignored {len(skipped)} previous Fuse output(s): {names}{more}[/yellow]"
             )
+        if unmatched:
+            names = ", ".join(unmatched[:5])
+            more = f" (+{len(unmatched) - 5} more)" if len(unmatched) > 5 else ""
+            extra.append(f"[yellow]No image matched: {names}{more}[/yellow]")
 
-        ui.header("Fuse", len(frames), source, frames, extra)
+        # Warn but carry on when the frames are not all one size.  The manual
+        # engine remaps mixed sizes happily - a cropped frame is a legitimate
+        # frame - but a stray merge file in the pile fits the geometry to nothing
+        # and the stitcher then stops with "No active images in ROI".
+        sizes = {s for p in frames if (s := frame_size(p)) is not None}
+        if args.aligner not in ("ais", "all") and len(sizes) > 1:
+            extra.append(
+                "[yellow]Frames have mixed pixel sizes: "
+                + ", ".join(f"{w}x{h}" for w, h in sorted(sizes))
+                + " (fine for a cropped frame, but check nothing stray like an old"
+                " merge ended up in the pile)[/yellow]"
+            )
+
+        where = specs[0] if len(specs) == 1 else " ".join(specs)
+        ui.header("Fuse", len(frames), where, frames, extra)
 
         plan = build_plan(tools, frames, outdir, args)
         failures = run_plan(ui, plan)
