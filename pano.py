@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["rich", "rich-argparse"]
+# dependencies = ["rich", "rich-argparse", "pillow"]
 # ///
 """
 Pano - classic Hugin panorama workflow, as a command-line tool.
@@ -28,6 +28,19 @@ Run it with uv (it pulls in `rich` automatically):
     uv run pano.py -i /photos/pano-row -o /photos/pano-row
 
 Notes / known gaps (this is a start, not a drop-in for every pano):
+  - -l/--lines N keeps at most N of linefind's vertical lines (default 5, no
+    filtering).  '-l filtered' (or '--line filtered') asks for a larger candidate
+    pool and then keeps only the lines that agree with each other, the longest per
+    frame: linefind flags what looks vertical in the *picture*, which is not the
+    same as vertical in the world once the camera is pitched, and a single leaning
+    edge left in the set bends the whole fit.  On a test panorama that took the
+    surviving lines from -3.2..+1.8 degrees off vertical to within 0.2.
+  - the aligned (remapped) frames are written to aligned/ (one per input, on the
+    panorama canvas, TIFF/LZW) - --no-aligned skips them, since they cost a second
+    pass and roughly 25 MB per frame.
+  - --line-overlays (implied by -d) writes lines/<frame>_overlay.jpg with the
+    detected lines drawn on the frame: red vertical, blue horizontal, and orange
+    for lines the filter dropped.
   - the anchor is implemented by ordering: the middle frame is listed first in
     the project, so pair-wise optimisation (autooptimiser -p) starts from it.
   - step 6 measures each control point's residual in *panorama* pixels via
@@ -74,6 +87,10 @@ try:
 except ImportError:  # keep working (plainer) if rich is somehow unavailable
     HAVE_RICH = False
     _HELP_FORMATTER = argparse.RawDescriptionHelpFormatter
+
+# Needed only for the line overlays, but imported up here to keep every import at
+# module level; the script metadata above asks uv for it.
+from PIL import Image, ImageDraw
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +377,10 @@ STEP_ICONS: tuple[tuple[str, str], ...] = (
     ("Removing points", "🧹"),
     ("Centering", "🧭"),
     ("Calculating output size", "📐"),
+    ("Drawing line overlays", "🖍️"),
+    ("Filtering line constraints", "🧹"),
+    ("Preparing aligned frames", "🧭"),
+    ("Rendering aligned frames", "🖼️"),
     ("Stitching", "🧵"),
     ("Skipping", "⏩"),
     ("ImageMagick not found", "⚠️"),
@@ -386,6 +407,103 @@ def _pto_image_paths(pto_path: Path) -> list[str]:
             if m:
                 paths.append(m.group(1))
     return paths
+
+
+def pto_lines(pto_path: Path) -> list[tuple[int, float, float, float, float, str]]:
+    """Vertical/horizontal line control points: (image, x1, y1, x2, y2, kind).
+
+    linefind writes each detected line as one 'c' line whose two points sit in
+    the same image (n == N), tagged t1 (vertical) or t2 (horizontal).
+    """
+    found: list[tuple[int, float, float, float, float, str]] = []
+    text = Path(pto_path).read_text(encoding="utf-8", errors="replace")
+    for line in text.splitlines():
+        if not line.startswith("c "):
+            continue
+        values: dict[str, str] = {}
+        for token in line.split()[1:]:
+            values[token[0]] = token[1:].lstrip("=")
+        if values.get("t") not in ("1", "2"):
+            continue
+        try:
+            found.append(
+                (
+                    int(values["n"]),
+                    float(values["x"]),
+                    float(values["y"]),
+                    float(values["X"]),
+                    float(values["Y"]),
+                    "vertical" if values["t"] == "1" else "horizontal",
+                )
+            )
+        except (KeyError, ValueError):
+            continue
+    return found
+
+
+def draw_line_overlays(
+    pto_path: Path, kept_pto: Path | None, outdir: Path, max_px: int = 1600
+) -> str:
+    """Write each frame with its detected lines drawn over it, in red.
+
+    The counterpart of Fuse's mask overlays: one small JPEG per frame, so a line
+    that was detected - and, more to the point, one that was detected wrongly -
+    can be seen where it sits instead of being inferred from numbers in a project
+    file.  When filtering has run, lines that were dropped are drawn in orange, so
+    the two sets can be told apart at a glance.
+    """
+    lines = pto_lines(pto_path)
+    if not lines:
+        return "no vertical or horizontal lines in the project - nothing to draw"
+    kept_keys = {(n, x1, y1, x2, y2) for n, x1, y1, x2, y2, _ in pto_lines(kept_pto or pto_path)}
+
+    sources: list[Path | None] = []
+    for raw in _pto_image_paths(pto_path):
+        for candidate in (Path(raw), Path.cwd() / raw, pto_path.parent / raw):
+            if candidate.exists():
+                sources.append(candidate)
+                break
+        else:
+            sources.append(None)
+
+    by_image: dict[int, list[tuple[float, float, float, float, str]]] = {}
+    for image, x1, y1, x2, y2, kind in lines:
+        by_image.setdefault(image, []).append((x1, y1, x2, y2, kind))
+
+    overlays = outdir / "lines"
+    overlays.mkdir(parents=True, exist_ok=True)
+    drawn: list[Path] = []
+    for index, segments in sorted(by_image.items()):
+        if index >= len(sources) or sources[index] is None:
+            continue
+        source = sources[index]
+        with Image.open(source) as opened:
+            picture = opened.convert("RGB")
+        draw = ImageDraw.Draw(picture)
+        width = max(2, round(max(picture.size) / 700))
+        for x1, y1, x2, y2, kind in segments:
+            if kind == "vertical":
+                kept = (round(x1), round(y1), round(x2), round(y2)) in {
+                    (round(k[1]), round(k[2]), round(k[3]), round(k[4])) for k in kept_keys
+                } or (round(x1), round(y1), round(x2), round(y2)) in {  # either endpoint order
+                    (round(k[3]), round(k[4]), round(k[1]), round(k[2])) for k in kept_keys
+                }
+                colour = (255, 0, 0) if kept else (255, 140, 0)
+            else:
+                colour = (0, 128, 255)
+            draw.line((x1, y1, x2, y2), fill=colour, width=width)
+        picture.thumbnail((max_px, max_px))
+        target = overlays / f"{source.stem}_overlay.jpg"
+        picture.save(target, quality=88)
+        drawn.append(target)
+
+    if not drawn:
+        return f"{len(lines)} line(s) found, but no frame they refer to could be opened"
+    return (
+        f"{len(lines)} line(s) on {len(drawn)} frame(s), red = vertical, blue = horizontal"
+        + (", orange = dropped by the line filter" if kept_pto is not None else "")
+        + f" -> {overlays.name}/"
+    )
 
 
 def _normalize_project_text(pto_path: Path) -> int:
@@ -645,6 +763,122 @@ def measure_residuals(tools: dict, src_pto: Path) -> list[float]:
     ]
 
 
+LINE_TOLERANCE = 1.5  # degrees a kept line may sit from the median line
+LINE_COUNT_DEFAULT = 5  # what plain -l asks linefind for
+LINE_COUNT_FILTERED = 40  # what -l filtered asks for, before filtering
+
+
+def filter_line_constraints(
+    tools: dict, src_pto: Path, dst_pto: Path, tolerance: float = LINE_TOLERANCE
+) -> str:
+    """Keep only the lines that agree with each other, the longest one per frame.
+
+    linefind flags whatever looks vertical *in the picture*, which is not the same
+    as vertical in the world once the camera is pitched, and it will accept a
+    leaning edge.  The good ones broadly agree on a tilt and the bad ones stick
+    out, so: measure every line's tilt in the fitted panorama, drop whatever sits
+    more than `tolerance` degrees from the median, then keep just the longest
+    survivor per frame - one vertical is enough to pin that frame's roll, and the
+    longest segment gives the steadiest angle.  Taking the median removes the
+    panorama's own (arbitrary) roll, so the test does not care which way the fit
+    happened to land.  A frame whose lines all fail the test keeps the one nearest
+    the median rather than losing its constraint altogether.
+    """
+    lines = Path(src_pto).read_text(encoding="utf-8", errors="replace").split("\n")
+    entries = []
+    for index, text in enumerate(lines):
+        if not text.startswith("c "):
+            continue
+        values = {}
+        for token in text.split()[1:]:
+            values[token[0]] = token[1:].lstrip("=")
+        if values.get("t") != "1":
+            continue
+        try:
+            entries.append(
+                (
+                    index,
+                    int(values["n"]),
+                    float(values["x"]),
+                    float(values["y"]),
+                    float(values["X"]),
+                    float(values["Y"]),
+                )
+            )
+        except (KeyError, ValueError):
+            continue
+    if not entries:
+        shutil.copyfile(src_pto, dst_pto)
+        return "No vertical lines to check - kept everything"
+
+    payload = "".join(f"{n} {x} {y}\n{n} {X} {Y}\n" for _, n, x, y, X, Y in entries)
+    proc = subprocess.run(
+        [tools["pano_trafo"], str(src_pto)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if proc.returncode != 0:
+        tail = (proc.stderr or "").strip().splitlines()
+        raise RuntimeError(
+            f"Line check failed (pano_trafo): {tail[-1] if tail else proc.returncode}"
+        )
+    points: list[tuple[float, float]] = []
+    for out_line in proc.stdout.splitlines():
+        floats = _FLOAT_RE.findall(out_line)
+        if len(floats) >= 2:
+            points.append((float(floats[0]), float(floats[1])))
+    if len(points) != 2 * len(entries):
+        raise RuntimeError(
+            f"pano_trafo returned {len(points)} points for {2 * len(entries)} queries"
+        )
+
+    measured = []
+    for i, entry in enumerate(entries):
+        (ax, ay), (bx, by) = points[2 * i], points[2 * i + 1]
+        tilt = math.degrees(math.atan2(bx - ax, by - ay))
+        length = math.hypot(entry[5] - entry[3], entry[4] - entry[2])
+        measured.append((tilt, length, entry))
+    ordered = sorted(m[0] for m in measured)
+    middle = len(ordered) // 2
+    median = ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
+
+    kept: dict[int, tuple[float, float, tuple]] = {}
+    nearest: dict[int, tuple[float, float, tuple]] = {}
+    dropped: list[tuple[float, float, tuple]] = []
+    for tilt, length, entry in measured:
+        image = entry[1]
+        if abs(tilt - median) <= tolerance:
+            if image not in kept or length > kept[image][1]:
+                kept[image] = (tilt, length, entry)
+        else:
+            dropped.append((tilt, length, entry))
+        if image not in nearest or abs(tilt - median) < abs(nearest[image][0] - median):
+            nearest[image] = (tilt, length, entry)
+    for image, best in nearest.items():
+        kept.setdefault(image, best)  # never leave a frame without a constraint
+
+    kept_indexes = {entry[0] for _, _, entry in kept.values()}
+    # Everything measured is dropped unless it is the survivor kept for its frame:
+    # a short line constrains the fit just as hard as a long one, but its endpoints
+    # are located less accurately, so keeping the extras is what bends the fit.
+    drop_indexes = {entry[0] for _, _, entry in measured} - kept_indexes
+    Path(dst_pto).write_text(
+        "\n".join(ln for i, ln in enumerate(lines) if i not in drop_indexes), encoding="utf-8"
+    )
+
+    report = f"{len(entries)} line(s) checked, kept {len(kept)} (longest per frame)"
+    if dropped:
+        worst = max(dropped, key=lambda d: abs(d[0] - median))
+        report += (
+            f"; dropped {len(drop_indexes)}: image {worst[2][1]} sat {worst[0] - median:+.1f}"
+            " deg off the median"
+        )
+    return report
+
+
 def residual_stats(tools: dict, src_pto: Path) -> str:
     """One-line max/RMS residual report for a project."""
     dists = measure_residuals(tools, src_pto)
@@ -661,9 +895,18 @@ def build_plan(
     outdir.mkdir(parents=True, exist_ok=True)
     plan: dict[str, list[Step]] = {}
     prefix = args.prefix
+
     # Hugin's stitch path cannot open absolute non-ASCII paths on Windows: hand
     # it a CWD-relative prefix (a bare name when working in the output folder).
-    stitch_prefix = os.path.relpath(outdir / prefix, Path.cwd())
+    # Across drives there is no relative form, so fall back to the absolute path
+    # rather than failing outright.
+    def safe_prefix(path: Path) -> str:
+        try:
+            return os.path.relpath(path, Path.cwd())
+        except ValueError:
+            return str(path)
+
+    stitch_prefix = safe_prefix(outdir / prefix)
     # Output projection for the stitch (Hugin numbers: 0 = rectilinear, 2 = equirectangular).
     proj = {"equirectangular": 2, "e": 2, "rectilinear": 0, "r": 0}[args.projection]
     # LDR output type for the stitch; JPG gets an explicit quality to match Fuse.
@@ -763,10 +1006,45 @@ def build_plan(
         )
     )
 
-    def clean_action() -> str | None:
-        return filter_residuals(
-            tools, outdir / "05_geometry1.pto", outdir / "06_clean.pto", args.threshold
+    # The line filter: linefind will accept a leaning edge, and a few bad
+    # constraints pull the whole fit off vertical.  Needs a fitted project below
+    # it, hence the position, and everything downstream reads the filtered one.
+    filtered_lines = outdir / "05b_lines.pto"
+    if args.line_filter and args.do_lines:
+
+        def line_filter_action() -> str:
+            return filter_line_constraints(tools, outdir / "05_geometry1.pto", filtered_lines)
+
+        steps.append(
+            Step(
+                "Filtering line constraints",
+                on_done=line_filter_action,
+                outputs=[filtered_lines],
+            )
+            if args.force or not filtered_lines.exists()
+            else Step("Filtering line constraints", note="Exists: 05b_lines.pto - skipping")
         )
+
+    geometry = filtered_lines if args.line_filter and args.do_lines else outdir / "05_geometry1.pto"
+
+    if args.line_overlays:
+        if args.do_lines:
+            kept_pto = filtered_lines if args.line_filter else None
+
+            def overlays_action(kept_pto=kept_pto) -> str:
+                return draw_line_overlays(outdir / "03_lines.pto", kept_pto, outdir)
+
+            steps.append(Step("Drawing line overlays", on_done=overlays_action))
+        else:
+            steps.append(
+                Step(
+                    "Drawing line overlays",
+                    note="--no-lines was given, so there are no lines to draw",
+                )
+            )
+
+    def clean_action() -> str | None:
+        return filter_residuals(tools, geometry, outdir / "06_clean.pto", args.threshold)
 
     steps.append(
         Step(
@@ -915,6 +1193,41 @@ def build_plan(
         if args.force or not stitch_outputs()
         else Step("Stitching", note=f"Exists: {prefix}* output - skipping")
     )
+
+    # The aligned (remapped) frames, in a subfolder the way Fuse keeps its own:
+    # the same panorama canvas, one image per input, so the fit can be looked at
+    # frame by frame.  Rendered from a copy of the sized project with the output
+    # type switched to remapping, so the stitch above is untouched.
+    if args.aligned:
+        aligned_dir = outdir / "aligned"
+        aligned_dir.mkdir(parents=True, exist_ok=True)
+        remap_pto = aligned_dir / "remap.pto"
+        remap_prefix = safe_prefix(aligned_dir / "frame_")
+
+        def remap_step(remap_pto=remap_pto):
+            return [
+                tools["pano_modify"],
+                "-o",
+                str(remap_pto),
+                "--output-type=REMAP",
+                "--output-uncropped-tiff",
+                "--ldr-file=TIFF",
+                "--ldr-compression=LZW",
+                str(outdir / "09_sized.pto"),
+            ]
+
+        steps.append(Step("Preparing aligned frames", cmd_fn=remap_step, outputs=[remap_pto]))
+        steps.append(
+            Step(
+                "Rendering aligned frames",
+                [
+                    tools["hugin_executor"],
+                    "--stitching",
+                    f"--prefix={remap_prefix}",
+                    str(remap_pto),
+                ],
+            )
+        )
 
     # Metadata comes from the anchor frame first and the final frame last, so
     # the final frame (which also gives the output its name) wins conflicts.
@@ -1160,8 +1473,11 @@ def display_dir(path: Path) -> str:
 
 
 class LinesToggle(argparse.Action):
-    """--lines [N] / --no-lines on one help line: bare --lines uses linefind
-    defaults, --lines N caps the kept lines at N, --no-lines skips detection."""
+    """-l/--lines [N] / -l filtered / --no-lines on one help line.
+
+    Bare -l uses linefind's own default count, -l N caps the kept lines at N,
+    -l filtered (or --line filtered) takes a larger candidate pool and then
+    filters it, and --no-lines skips detection."""
 
     def __init__(self, option_strings, dest, **kwargs):
         super().__init__(option_strings, dest, nargs="?", const=True, default=True, **kwargs)
@@ -1171,12 +1487,18 @@ class LinesToggle(argparse.Action):
             namespace.do_lines = False
         elif values is True:
             namespace.do_lines = True
-            namespace.line_count = 5
+            namespace.line_count = LINE_COUNT_DEFAULT
+        elif isinstance(values, str) and values.lower().startswith("filter"):
+            namespace.do_lines = True
+            namespace.line_filter = True
+            namespace.line_count = LINE_COUNT_FILTERED
         else:
             try:
                 count = int(values)
             except (TypeError, ValueError) as err:
-                raise argparse.ArgumentError(self, f"expected an integer, got {values!r}") from err
+                raise argparse.ArgumentError(
+                    self, f"expected an integer or 'filtered', got {values!r}"
+                ) from err
             if count < 1:
                 raise argparse.ArgumentError(self, "count must be >= 1")
             namespace.do_lines = True
@@ -1218,13 +1540,16 @@ def main() -> int:
     ap.add_argument(
         "-l",
         "--lines",
+        "--line",
         "--no-lines",
         dest="do_lines",
         action=LinesToggle,
         metavar="N",
-        help="detect vertical lines with linefind (default: on; --lines N keeps at most N)",
+        help="detect vertical lines with linefind (default: on, 5 of them);"
+        " '-l N' keeps at most N, '-l filtered' takes a larger candidate pool and"
+        " keeps only the lines that agree with each other, --no-lines skips them",
     )
-    ap.set_defaults(line_count=5)
+    ap.set_defaults(line_count=LINE_COUNT_DEFAULT, line_filter=False)
     ap.add_argument(
         "-s",
         "--straighten",
@@ -1264,6 +1589,25 @@ def main() -> int:
         help="output projection for the stitch (default: equirectangular)",
     )
     ap.add_argument(
+        "--aligned",
+        "--no-aligned",
+        dest="aligned",
+        action=Toggle,
+        off=["--no-aligned"],
+        default=True,
+        help="render the aligned (remapped) frames into the 'aligned' subfolder (default: on)",
+    )
+    ap.add_argument(
+        "--line-overlays",
+        "--no-line-overlays",
+        dest="line_overlays",
+        action=Toggle,
+        off=["--no-line-overlays"],
+        default=False,
+        help="write each frame with its detected lines drawn on it, in the 'lines'"
+        " subfolder (default: off; -d implies on)",
+    )
+    ap.add_argument(
         "-f",
         "--force",
         action="store_true",
@@ -1288,6 +1632,7 @@ def main() -> int:
 
     if args.develop:
         args.verbose = True
+        args.line_overlays = True
 
     setup_console()
     ui = UI(verbose=args.verbose, no_color=args.no_color, log_path=args.log)
