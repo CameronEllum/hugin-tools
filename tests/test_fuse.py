@@ -11,7 +11,7 @@ import pytest
 from hugin_tools import fuse
 
 
-def make_args(argv, overlays_on=False):
+def make_args(argv, overlays_on=False, clean=True):
     ap = argparse.ArgumentParser()
     fuse.add_arguments(ap)
     args = ap.parse_args(argv)
@@ -24,6 +24,8 @@ def make_args(argv, overlays_on=False):
     args.keep_merged = False
     args.keep_ptos = False
     args.overlays_on = overlays_on
+    args.clean = clean
+    args.clean_sigma = 3.0
     fuse.prepare_args(args)
     return args
 
@@ -44,7 +46,7 @@ def test_default_output_is_winsor():
 
 
 def test_naming_an_output_drops_the_default():
-    args = make_args(["--clean"])
+    args = make_args(["--motion-clean"])
     assert args.do_clean is True
     assert args.merge_types == []
     assert args.motion_options.clean is True
@@ -132,3 +134,20 @@ def test_keep_all():
     args.keep = True
     keep_all, _ = fuse.keep(args, fake_tools())
     assert keep_all is True
+
+
+def manual_commands(tmp_path, clean=True):
+    args = make_args(["--all", "--aligner", "manual"], clean=clean)
+    frames = [tmp_path / "a.tif", tmp_path / "b.tif"]
+    runplan = fuse.build(fake_tools(), frames, tmp_path, args)
+    return [" ".join(str(a) for a in step.cmd) for step in runplan.plan["manual"] if step.cmd]
+
+
+def test_manual_cleaning_uses_clean_sigma(tmp_path):
+    cpclean = [c for c in manual_commands(tmp_path) if "cpclean" in c]
+    assert len(cpclean) == 2  # before the first fit, and between the two
+    assert all("--max-distance=3" in c for c in cpclean)
+
+
+def test_manual_no_clean_skips_cpclean(tmp_path):
+    assert not any("cpclean" in c for c in manual_commands(tmp_path, clean=False))

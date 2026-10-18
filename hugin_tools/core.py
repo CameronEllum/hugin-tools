@@ -331,7 +331,8 @@ STEP_ICONS: tuple[tuple[str, str], ...] = (
     ("Setting anchor", "⚓"),
     ("Removing bad matches", "🧹"),
     ("Removing points", "🧹"),
-    ("Filtering line constraints", "🧹"),
+    ("Cleaning control points", "🧹"),
+    ("Checking line verticality", "📏"),
     ("Choosing alignment parameters", "🧭"),
     ("Optimising alignment", "🎯"),
     ("Optimising positions", "🎯"),
@@ -524,6 +525,17 @@ class Toggle(argparse.Action):
 
     def __call__(self, parser, namespace, values, option_string=None):
         setattr(namespace, self.dest, option_string not in self._off)
+
+
+def positive_float(text: str) -> float:
+    """Argparse type: a float greater than zero (so argparse reports it nicely)."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number, got {text!r}") from None
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return value
 
 
 def fmt_duration(seconds: float) -> str:

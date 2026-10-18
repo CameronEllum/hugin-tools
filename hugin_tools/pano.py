@@ -4,34 +4,51 @@ Mirrors the manual Hugin GUI workflow:
 
      1. import all jpgs in the folder (pto_gen; middle frame listed first)
      2. find control points (cpfind)
-     3. vertical-line control points (linefind, skipped with --no-lines)
+     3. find vertical lines (OpenCV LSD, validated against their vanishing point;
+        skipped with --no-lines)
      4. middle image as the anchor
-     5. geometric optimisation of positions, starting from the anchor
-     6. remove residuals (per-point pano-space distance above --threshold)
-     7. optimise positions again
-     8. center yaw, aim the view vertically (the "drag"), then autocrop
-     9. calculate optimal canvas size
-    10. stitch
+     5. clean the control points (cpclean)
+     6. geometric optimisation of positions, starting from the anchor
+     7. clean again, now including the line control points
+     8. [--clean-distance] remove pairs by panorama-space distance
+     9. optimise positions again
+    10. center yaw and aim the view vertically
+    11. autocrop, then calculate the optimal canvas size
+    12. stitch
 
 Numbered .pto projects are written after every step, under the scratch folder
 (<outdir>/.hugin_tools/pano), so any step can be opened in the Hugin GUI and
 inspected; they are deleted at the end unless kept with -k/--keep or --keep-ptos.
 
-Notes / known gaps:
-  - -l/--lines N keeps at most N of linefind's vertical lines (default 5, no
-    filtering).  '-l filtered' (or '--line filtered') asks for a larger candidate
-    pool and then keeps only the lines that agree with each other, the longest
-    per frame.
+Notes:
+  - linefind is deliberately not used.  It accepts whatever looks vertical *in
+    the picture*, which is not vertical in the world once the camera is pitched
+    or rolled.  Vertical lines in the world all pass through a single vanishing
+    point, so LSD's candidate segments are checked against that point - the
+    longest ones propose it and the rest are judged by how well they agree - and
+    the ones that disagree are dropped.  cpclean then has a further pass over the
+    whole project, lines included (--no-clean switches cleaning off).
+  - the fit itself levels the panorama once the vertical lines are in it, because
+    a t1 line pins the image's roll to the world's vertical.  pano_modify
+    --straighten therefore only adds a correction on top, measured at about 0.5
+    degrees of roll on the test panorama: it is off by default (-s turns it on).
+  - --clean-sigma tunes that cleaning: a control point goes when its error is
+    more than that many standard deviations above the mean (cpclean's own knob).
+  - -l/--lines N caps how many line control points each frame contributes
+    (default: no cap); --no-lines skips detection entirely.
+  - --line-min-length is the shortest segment worth keeping, as a fraction of
+    the frame's long side (default: 0.01, i.e. 1%).
   - the aligned (remapped) frames are written to the scratch folder's aligned/
     (one per input, on the panorama canvas, TIFF/LZW) when --aligned is given;
     they cost a second pass and roughly 25 MB per frame, so they are off by
     default (-d implies on).
   - --overlays (implied by -d) writes lines/<frame>_overlay.jpg with the detected
-    lines drawn on the frame: red vertical, blue horizontal, and orange for lines
-    the filter dropped.
+    lines drawn on the frame: red for lines the fit kept, orange for ones cpclean
+    dropped.
   - the anchor is implemented by ordering: the middle frame is listed first.
-  - step 6 measures residuals in panorama pixels via pano_trafo and drops pairs
-    above --threshold (default 3px).
+  - --clean-distance (off by default) also drops control-point pairs whose
+    panorama-space distance is above --threshold (default 3px); cpclean's
+    statistical cut is the primary cleaner and this is a hard backstop.
   - stitch outputs are named <last frame>_<projection>.<ext> and get that frame's
     metadata (plus the anchor frame's, with the last frame winning on conflicts).
 """
@@ -55,7 +72,7 @@ from .core import RunPlan, Step, copy_file, relpath, scratch_dir
 PANO_REQUIRED = [
     "pto_gen",
     "cpfind",
-    "linefind",
+    "cpclean",
     "autooptimiser",
     "pano_modify",
     "pano_trafo",
@@ -148,7 +165,7 @@ def draw_line_overlays(
     The counterpart of Fuse's mask overlays: one small JPEG per frame, so a line
     that was detected - and, more to the point, one that was detected wrongly -
     can be seen where it sits.  Red = vertical, blue = horizontal, and orange for
-    lines the filter dropped when filtering has run.
+    lines a later step dropped (the *kept* project, normally after cpclean).
     """
     from PIL import Image, ImageDraw  # only the overlay path needs Pillow
 
@@ -201,9 +218,9 @@ def draw_line_overlays(
     if not drawn:
         return f"{len(lines)} line(s) found, but no frame they refer to could be opened"
     return (
-        f"{len(lines)} line(s) on {len(drawn)} frame(s), red = vertical, blue = horizontal"
-        + (", orange = dropped by the line filter" if kept_pto is not None else "")
-        + f" -> {overlays.name}/"
+        f"{len(lines)} line(s) on {len(drawn)} frame(s), red = kept, blue = horizontal"
+        + (", orange = dropped by cpclean" if kept_pto is not None else "")
+        + f" -> {overlays_dir.name}/"
     )
 
 
@@ -440,37 +457,327 @@ def measure_residuals(tools: dict, src_pto: Path) -> list[float]:
     ]
 
 
-LINE_TOLERANCE = 1.5  # degrees a kept line may sit from the median line
-LINE_COUNT_DEFAULT = 5  # what plain -l asks linefind for
-LINE_COUNT_FILTERED = 40  # what -l filtered asks for, before filtering
+# ---------------------------------------------------------------------------
+#  Vertical lines: OpenCV LSD candidates, validated against their vanishing point
+# ---------------------------------------------------------------------------
+# linefind looks for whatever seems vertical *in the picture*, which is not
+# vertical in the world once the camera is pitched or rolled: on a pitched camera
+# honest verticals lean away from the centre of the frame, and a leaning edge can
+# look perfectly upright.  What every world-vertical does have in common is its
+# vanishing point, so that is what the candidates are checked against.  A coarse
+# direction test only seeds the search; the vanishing point does the real work,
+# and cpclean then has the final say along with everything else in the project.
+LINE_MIN_FRACTION = 0.01  # shortest candidate segment, as a share of the long side
+LINE_SEED_DEG = 60.0  # candidates must start within this of image-vertical
+LINE_VP_GATE = 1.5  # ... and end within this of the agreed vanishing point
+LINE_VP_IRLS = 12  # reweighting passes when refining the vanishing point
+LINE_VP_SEED = 10  # longest candidates that get to propose vanishing points
+LINE_VP_MIN_SUPPORT = 4  # lines a bundle needs before it is worth believing
+LINE_LEAN_TOLERANCE = 0.3  # degrees a line may lean in the finished panorama
 
 
-def filter_line_constraints(
-    tools: dict, src_pto: Path, dst_pto: Path, tolerance: float = LINE_TOLERANCE
-) -> str:
-    """Keep only the lines that agree with each other, the longest one per frame.
+def _normalise_angle(angle: float) -> float:
+    """Fold an angle from atan2 into (-90, 90]: a line has no direction."""
+    while angle > 90.0:
+        angle -= 180.0
+    while angle <= -90.0:
+        angle += 180.0
+    return angle
 
-    linefind flags whatever looks vertical *in the picture*, which is not the same
-    as vertical in the world once the camera is pitched.  The good lines broadly
-    agree on a tilt and the bad ones stick out: measure every line's tilt in the
-    fitted panorama, drop whatever sits more than `tolerance` degrees from the
-    median, then keep just the longest survivor per frame.  A frame whose lines
-    all fail keeps the one nearest the median rather than losing its constraint.
+
+def segment_angle_deg(x1: float, y1: float, x2: float, y2: float) -> float:
+    """A segment's direction as an angle from image-vertical, in (-90, 90]."""
+    return _normalise_angle(math.degrees(math.atan2(x2 - x1, y2 - y1)))
+
+
+def load_gray(path: Path):
+    """One frame as a grayscale uint8 array, stretched for the detector.
+
+    Hugin's own tools read the frames; this is the only place we look at pixels.
+    The stretch matters for night frames, where the useful edges live in a narrow
+    slice of the range.
     """
-    lines = Path(src_pto).read_text(encoding="utf-8", errors="replace").split("\n")
-    entries = []
-    for index, text in enumerate(lines):
-        if not text.startswith("c "):
+    import numpy as np
+    from PIL import Image
+
+    with Image.open(path) as opened:
+        gray = np.asarray(opened.convert("L"))
+    if gray.size == 0:
+        return gray
+    low, high = np.percentile(gray, (2.0, 98.0))
+    if high > low:
+        scaled = (gray.astype(np.float32) - float(low)) * (255.0 / (float(high) - float(low)))
+        gray = np.clip(scaled, 0.0, 255.0).astype(np.uint8)
+    return gray
+
+
+def segments_from_array(gray, min_length: float = 0.0) -> list[tuple]:
+    """Line segments in one grayscale frame: (x1, y1, x2, y2, length, score).
+
+    OpenCV's LSD finds edges in every direction and knows nothing about verticals
+    - that judgement belongs to `select_vertical_segments`.  The score is LSD's
+    number-of-false-alarms figure (lower is better) where the build reports one,
+    otherwise 0.
+    """
+    import cv2
+    import numpy as np
+
+    if gray is None or getattr(gray, "size", 0) == 0:
+        return []
+    if gray.dtype != np.uint8:
+        gray = np.clip(np.asarray(gray), 0, 255).astype(np.uint8)
+    detector = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD)
+    found = detector.detect(gray)
+    segments = found[0] if found else None
+    if segments is None:
+        return []
+    nfa = found[3] if len(found) > 3 else None
+    out: list[tuple] = []
+    for index, segment in enumerate(segments):
+        x1, y1, x2, y2 = (float(v) for v in np.asarray(segment).ravel()[:4])
+        length = math.hypot(x2 - x1, y2 - y1)
+        if length < min_length:
             continue
-        values = {}
-        for token in text.split()[1:]:
+        score = float(nfa[index][0]) if nfa is not None else 0.0
+        out.append((x1, y1, x2, y2, length, score))
+    return out
+
+
+def _line_normals(segments):
+    """Plane normal per segment, as a unit 3-vector in the camera's own frame.
+
+    The two rays through a segment's endpoints span a plane, and the world's
+    vertical direction has to lie in that plane: n = r1 x r2, with the constraint
+    d . n == 0.  Normalising the whole normal (not just its first two components,
+    which is the segment's length) is what keeps a distant vanishing point from
+    winning: the residual stays an angle instead of shrinking with the distance.
+    """
+    import numpy as np
+
+    rows = [(y1 - y2, x2 - x1, x1 * y2 - x2 * y1) for x1, y1, x2, y2, _l, _s in segments]
+    normals = np.asarray(rows, dtype=float)
+    norm = np.linalg.norm(normals, axis=1)
+    norm[norm == 0.0] = 1.0
+    return normals / norm[:, None]
+
+
+def vp_residuals(segments, v) -> list[float]:
+    """Per-segment angular distance (degrees) from a vanishing point.
+
+    Measured as the angle between the segment and the direction from its midpoint
+    to the point, which stays meaningful however far away the point is (for a
+    level camera it is at infinity).
+    """
+    import numpy as np
+
+    v = np.asarray(v, dtype=float)
+    if float(np.linalg.norm(v)) > 0:
+        v = v / float(np.linalg.norm(v))
+    finite = abs(v[2]) > 1e-9
+    if finite:  # a finite vanishing point in the image plane
+        point = np.array([v[0] / v[2], v[1] / v[2]])
+    else:  # at infinity: the segments should all share one direction
+        direction = np.array([v[0], v[1]])
+        size = float(np.linalg.norm(direction))
+        direction = direction / size if size else np.array([0.0, -1.0])
+
+    residuals: list[float] = []
+    for x1, y1, x2, y2, length, _score in segments:
+        if length <= 0.0:
+            residuals.append(90.0)
+            continue
+        segment = np.array([(x2 - x1) / length, (y2 - y1) / length])
+        if finite:
+            to_point = point - np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0])
+            reach = float(np.linalg.norm(to_point))
+            if reach < 1e-9:
+                residuals.append(0.0)
+                continue
+            to_point = to_point / reach
+        else:
+            to_point = direction
+        dot = float(np.clip(abs(segment @ to_point), 0.0, 1.0))
+        residuals.append(math.degrees(math.acos(dot)))
+    return residuals
+
+
+def vertical_vp(segments):
+    """Fit the vertical vanishing point of a frame's candidate segments.
+
+    Returns (v, residual angles in degrees), or None when there is not enough to
+    fit.  v is the vertical *direction* as a unit 3-vector: the vanishing point is
+    where that direction meets the image plane, so a third component of zero just
+    means the point is at infinity and a level camera needs no special case.
+
+    The longest candidates are the least ambiguous, so they fix the direction
+    first; every candidate is then reweighted against it (a Cauchy weight) so the
+    direction settles on the bundle most of the picture agrees with.
+    """
+    import numpy as np
+
+    if len(segments) < 2:
+        return None
+    normals = _line_normals(segments)
+    lengths = np.array([s[4] for s in segments], dtype=float)
+    # Seed on the long ones; a passel of short segments would otherwise drag the
+    # direction towards a distant, all-of-them-ish point.
+    seed = np.argsort(-lengths)[: max(6, len(segments) // 10)]
+    scatter = (normals[seed] * lengths[seed][:, None]).T @ normals[seed]
+    v = np.linalg.eigh(scatter)[1][:, 0]
+    for _ in range(LINE_VP_IRLS):
+        residuals = np.asarray(vp_residuals(segments, v), dtype=float)
+        spread = 1.4826 * float(np.median(np.abs(residuals - np.median(residuals))))
+        weights = lengths / (1.0 + (residuals / max(0.25, spread)) ** 2)
+        scatter = (normals * weights[:, None]).T @ normals
+        v = np.linalg.eigh(scatter)[1][:, 0]
+    return v, vp_residuals(segments, v)
+
+
+def vertical_candidates(segments, seed_deg: float = LINE_SEED_DEG) -> list[tuple]:
+    """Segments whose direction alone does not rule vertical out.
+
+    Only a seed: on a camera held anywhere near upright, a world-vertical cannot
+    point much more than 60 degrees away from the image's own vertical, so this
+    cheaply drops the horizon, roofs and other horizontals before any vanishing
+    point is considered.  Which of the survivors really are vertical is decided by
+    their agreement on one point, not by their direction.
+    """
+    return [s for s in segments if abs(segment_angle_deg(s[0], s[1], s[2], s[3])) <= seed_deg]
+
+
+def _pairwise_vps(normals, keep):
+    """Vanishing-point directions proposed by every pair of the given segments.
+
+    Two lines meet in a point, so each pair proposes one candidate direction
+    (d = n1 x n2, the vector at right angles to both planes).  The proposals are
+    then judged by how much of the frame agrees with them.
+    """
+    import numpy as np
+
+    proposals = []
+    for a in range(len(keep)):
+        for b in range(a + 1, len(keep)):
+            direction = np.cross(normals[keep[a]], normals[keep[b]])
+            size = float(np.linalg.norm(direction))
+            if size > 1e-9:
+                proposals.append(direction / size)
+    return proposals
+
+
+def select_vertical_segments(segments) -> tuple[list[tuple], str]:
+    """(kept segments, what happened) - the candidates sharing one vertical VP.
+
+    A vanishing point is proposed by pairs of the longest candidates and scored by
+    the total length of the candidates that agree with it (each within
+    LINE_VP_GATE degrees); the best proposal is then refined against its own
+    bundle.  Scoring by length is what keeps a large crowd of short segments from
+    voting down a few long building edges.
+    """
+    import numpy as np
+
+    upright = vertical_candidates(segments)
+    if len(upright) < LINE_VP_MIN_SUPPORT:
+        return (
+            [],
+            f"only {len(upright)} candidate(s) point within {LINE_SEED_DEG:g} deg of vertical",
+        )
+    normals = _line_normals(upright)
+    lengths = np.array([s[4] for s in upright], dtype=float)
+    keep = np.argsort(-lengths)[: max(LINE_VP_MIN_SUPPORT, min(LINE_VP_SEED, len(upright)))]
+
+    best_score, best, best_bundle = -1.0, None, None
+    for direction in _pairwise_vps(normals, keep):
+        residuals = np.asarray(vp_residuals(upright, direction), dtype=float)
+        bundle = np.flatnonzero(residuals <= LINE_VP_GATE)
+        score = float(lengths[bundle].sum())
+        if score > best_score:
+            best_score, best, best_bundle = score, direction, bundle
+    if best is None or len(best_bundle) < LINE_VP_MIN_SUPPORT:
+        return [], f"no bundle of {LINE_VP_MIN_SUPPORT} agreed on a vanishing point"
+
+    # Refine on the winning bundle, then judge the whole frame against it.
+    refined = vertical_vp([upright[i] for i in best_bundle])
+    v = refined[0] if refined is not None else best
+    residuals = np.asarray(vp_residuals(upright, v), dtype=float)
+    kept = [
+        segment
+        for segment, residual in zip(upright, residuals, strict=True)
+        if residual <= LINE_VP_GATE
+    ]
+    if len(kept) < LINE_VP_MIN_SUPPORT:
+        return [], f"only {len(kept)} line(s) agreed on a vanishing point"
+    return kept, f"{len(kept)} of {len(upright)} agree with the vanishing point"
+
+
+def _resolve_image(raw: str, pto_path: Path) -> Path | None:
+    """Find the file an image line names, the way the stitch path would."""
+    for candidate in (Path(raw), Path.cwd() / raw, Path(pto_path).parent / raw):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def detect_lines(
+    src_pto: Path,
+    dst_pto: Path,
+    *,
+    min_fraction: float = LINE_MIN_FRACTION,
+    max_per_image: int | None = None,
+) -> str:
+    """Write our own vertical-line control points into a copy of a project.
+
+    One t1 line per surviving segment, in linefind's own format
+    (``c nI NI x.. y.. X.. Y.. t1``, both ends in the same image), so nothing
+    downstream - Hugin's tools included - can tell the difference.  Returns a
+    one-line report for the transcript.
+    """
+    text = Path(src_pto).read_text(encoding="utf-8", errors="replace")
+    body = text.split("\n")
+    while body and not body[-1].strip():
+        body.pop()
+
+    written: list[str] = []
+    per_frame: list[str] = []
+    total = 0
+    for index, raw in enumerate(_pto_image_paths(src_pto)):
+        source = _resolve_image(raw, src_pto)
+        if source is None:
+            per_frame.append(f"{index}: unreadable")
+            continue
+        gray = load_gray(source)
+        segments = segments_from_array(gray, min_fraction * max(gray.shape))
+        total += len(segments)
+        kept, note = select_vertical_segments(segments)
+        if max_per_image:
+            kept = sorted(kept, key=lambda segment: segment[4], reverse=True)[:max_per_image]
+        for x1, y1, x2, y2, _length, _score in kept:
+            written.append(f"c n{index} N{index} x{x1:.3f} y{y1:.3f} X{x2:.3f} Y{y2:.3f} t1")
+        per_frame.append(f"{index}: {len(kept)}" if kept else f"{index}: none ({note})")
+
+    Path(dst_pto).write_text("\n".join([*body, *written]) + "\n", encoding="utf-8")
+    report = (
+        f"{total} segment(s) found, {len(written)} written as vertical lines"
+        f" (per frame: {', '.join(per_frame)})"
+    )
+    if not written:
+        report += " - WARNING: no vertical lines, so nothing levels the stitch"
+    return report
+
+
+def _t1_lines(pto_path: Path) -> list[tuple[int, float, float, float, float]]:
+    """(image, x1, y1, x2, y2) for every vertical (t1) line control point."""
+    found: list[tuple[int, float, float, float, float]] = []
+    for line in Path(pto_path).read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.startswith("c "):
+            continue
+        values: dict[str, str] = {}
+        for token in line.split()[1:]:
             values[token[0]] = token[1:].lstrip("=")
         if values.get("t") != "1":
             continue
         try:
-            entries.append(
+            found.append(
                 (
-                    index,
                     int(values["n"]),
                     float(values["x"]),
                     float(values["y"]),
@@ -480,11 +787,21 @@ def filter_line_constraints(
             )
         except KeyError, ValueError:
             continue
-    if not entries:
-        copy_file(src_pto, dst_pto)
-        return "No vertical lines to check - kept everything"
+    return found
 
-    payload = "".join(f"{n} {x} {y}\n{n} {X} {Y}\n" for _, n, x, y, X, Y in entries)
+
+def line_tilts(tools: dict, src_pto: Path) -> list[tuple[int, float]]:
+    """(image, tilt from panorama-vertical in degrees) for each t1 line.
+
+    Measured through pano_trafo, so it is what the stitch will actually do.  A
+    world-vertical keeps a constant azimuth, so in an equirectangular panorama it
+    comes out exactly vertical however the camera was pitched; any tilt here is a
+    line that leans, not a projection artefact.
+    """
+    entries = _t1_lines(src_pto)
+    if not entries:
+        return []
+    payload = "".join(f"{n} {x} {y}\n{n} {X} {Y}\n" for n, x, y, X, Y in entries)
     proc = subprocess.run(
         [tools["pano_trafo"], str(src_pto)],
         input=payload,
@@ -507,46 +824,30 @@ def filter_line_constraints(
         raise RuntimeError(
             f"pano_trafo returned {len(points)} points for {2 * len(entries)} queries"
         )
+    return [
+        (entries[i][0], _normalise_angle(math.degrees(math.atan2(bx - ax, by - ay))))
+        for i, ((ax, ay), (bx, by)) in enumerate(zip(points[::2], points[1::2], strict=True))
+    ]
 
-    measured = []
-    for i, entry in enumerate(entries):
-        (ax, ay), (bx, by) = points[2 * i], points[2 * i + 1]
-        tilt = math.degrees(math.atan2(bx - ax, by - ay))
-        length = math.hypot(entry[5] - entry[3], entry[4] - entry[2])
-        measured.append((tilt, length, entry))
-    ordered = sorted(m[0] for m in measured)
-    middle = len(ordered) // 2
-    median = ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
 
-    kept: dict[int, tuple[float, float, tuple]] = {}
-    nearest: dict[int, tuple[float, float, tuple]] = {}
-    dropped: list[tuple[float, float, tuple]] = []
-    for tilt, length, entry in measured:
-        image = entry[1]
-        if abs(tilt - median) <= tolerance:
-            if image not in kept or length > kept[image][1]:
-                kept[image] = (tilt, length, entry)
-        else:
-            dropped.append((tilt, length, entry))
-        if image not in nearest or abs(tilt - median) < abs(nearest[image][0] - median):
-            nearest[image] = (tilt, length, entry)
-    for image, best in nearest.items():
-        kept.setdefault(image, best)  # never leave a frame without a constraint
+def line_tilt_report(tools: dict, src_pto: Path) -> str:
+    """How vertical the lines came out in the finished panorama.
 
-    kept_indexes = {entry[0] for _, _, entry in kept.values()}
-    drop_indexes = {entry[0] for _, _, entry in measured} - kept_indexes
-    Path(dst_pto).write_text(
-        "\n".join(ln for i, ln in enumerate(lines) if i not in drop_indexes), encoding="utf-8"
+    A report, not a gate: cpclean has already decided which lines to keep, so this
+    only says how well the survivors agree - a set of true verticals lands within
+    a few tenths of a degree of each other.
+    """
+    tilts = line_tilts(tools, src_pto)
+    if not tilts:
+        return "No vertical lines survived into the final project"
+    magnitudes = sorted(abs(tilt) for _, tilt in tilts)
+    worst_image, worst = max(tilts, key=lambda item: abs(item[1]))
+    outside = sum(1 for value in magnitudes if value > LINE_LEAN_TOLERANCE)
+    return (
+        f"{len(tilts)} line(s) came out: median {magnitudes[len(magnitudes) // 2]:.2f} deg,"
+        f" worst {worst:+.2f} deg (image {worst_image}), {outside} over"
+        f" {LINE_LEAN_TOLERANCE:g} deg"
     )
-
-    report = f"{len(entries)} line(s) checked, kept {len(kept)} (longest per frame)"
-    if dropped:
-        worst = max(dropped, key=lambda d: abs(d[0] - median))
-        report += (
-            f"; dropped {len(drop_indexes)}: image {worst[2][1]} sat {worst[0] - median:+.1f}"
-            " deg off the median"
-        )
-    return report
 
 
 def residual_stats(tools: dict, src_pto: Path) -> str:
@@ -636,25 +937,22 @@ def build(tools: dict, frames: list[Path], outdir: Path, args) -> RunPlan:
         )
     )
     if args.do_lines:
-        steps.append(
-            checkpoint(
-                "Finding vertical lines",
-                pto / "03_lines.pto",
-                lambda dst: Step(
-                    "Finding vertical lines",
-                    [
-                        tools["linefind"],
-                        "-o",
-                        dst,
-                        f"--lines={args.line_count}",
-                        pto / "02_features.pto",
-                    ],
-                ),
-            )
-        )
+
+        def detect_step(dst: Path) -> Step:
+            def run() -> str:
+                return detect_lines(
+                    pto / "02_features.pto",
+                    dst,
+                    min_fraction=args.line_min_length,
+                    max_per_image=args.line_count,
+                )
+
+            return Step("Finding vertical lines", on_done=run)
+
+        steps.append(checkpoint("Finding vertical lines", pto / "03_vlines.pto", detect_step))
 
     # Without lines the anchor is copied straight from the cpfind project.
-    lines_src = pto / "03_lines.pto" if args.do_lines else pto / "02_features.pto"
+    lines_src = pto / "03_vlines.pto" if args.do_lines else pto / "02_features.pto"
 
     def anchor_action() -> str | None:
         copy_file(lines_src, pto / "04_anchor.pto")
@@ -666,39 +964,70 @@ def build(tools: dict, frames: list[Path], outdir: Path, args) -> RunPlan:
         else Step("Setting anchor", note="Exists: 04_anchor.pto - skipping")
     )
 
+    # cpclean before the fit: only the feature matches mean anything yet (our
+    # lines have not been judged by any geometry), so this pass trims those.
+    sigma = f"--max-distance={args.clean_sigma:g}"
+    if args.clean:
+        steps.append(
+            checkpoint(
+                "Removing bad matches",
+                pto / "05_clean.pto",
+                lambda dst: Step(
+                    "Removing bad matches",
+                    [
+                        tools["cpclean"],
+                        "--whole-pano-checking",
+                        sigma,
+                        f"--output={dst}",
+                        pto / "04_anchor.pto",
+                    ],
+                ),
+            )
+        )
+    geometry0 = pto / "05_clean.pto" if args.clean else pto / "04_anchor.pto"
+
     steps.append(
         checkpoint(
             "Optimising positions",
-            pto / "05_geometry1.pto",
+            pto / "06_geometry1.pto",
             lambda dst: Step(
-                "Optimising positions",
-                [tools["autooptimiser"], "-p", "-o", dst, pto / "04_anchor.pto"],
+                "Optimising positions", [tools["autooptimiser"], "-p", "-o", dst, geometry0]
             ),
         )
     )
 
-    # The line filter: linefind will accept a leaning edge, and a few bad
-    # constraints pull the whole fit off vertical.  Needs a fitted project below.
-    filtered_lines = pto / "05b_lines.pto"
-    if args.line_filter and args.do_lines:
-
-        def line_filter_action() -> str:
-            return filter_line_constraints(tools, pto / "05_geometry1.pto", filtered_lines)
-
+    # Now that there is a fit to judge them against, clean again - this time with
+    # the line control points included, so cpclean weighs our verticals alongside
+    # cpfind's matches.  On the test night stack this cut proved blunt (it removed
+    # one line out of hundreds, since a line's error in pano pixels is small
+    # against the feature matches'): which lines are vertical is really decided by
+    # the detector's vanishing-point test above, and this pass is here for the
+    # cases where cpclean does have something to say.
+    if args.clean:
         steps.append(
-            Step("Filtering line constraints", on_done=line_filter_action, outputs=[filtered_lines])
-            if args.force or not filtered_lines.exists()
-            else Step("Filtering line constraints", note="Exists: 05b_lines.pto - skipping")
+            checkpoint(
+                "Cleaning control points",
+                pto / "07_cleanlines.pto",
+                lambda dst: Step(
+                    "Cleaning control points",
+                    [
+                        tools["cpclean"],
+                        "--check-line-cp",
+                        sigma,
+                        f"--output={dst}",
+                        pto / "06_geometry1.pto",
+                    ],
+                ),
+            )
         )
-
-    geometry = filtered_lines if args.line_filter and args.do_lines else pto / "05_geometry1.pto"
+    geometry1 = pto / "07_cleanlines.pto" if args.clean else pto / "06_geometry1.pto"
 
     if args.overlays_on:
         if args.do_lines:
-            kept_pto = filtered_lines if args.line_filter else None
+            kept_pto = pto / "07_cleanlines.pto" if args.clean else None
 
             def overlays_action(kept_pto=kept_pto) -> str:
-                return draw_line_overlays(pto / "03_lines.pto", kept_pto, overlays_dir)
+                return draw_line_overlays(pto / "03_vlines.pto", kept_pto, overlays_dir)
 
             steps.append(Step("Drawing line overlays", on_done=overlays_action))
         else:
@@ -709,36 +1038,42 @@ def build(tools: dict, frames: list[Path], outdir: Path, args) -> RunPlan:
                 )
             )
 
-    def clean_action() -> str | None:
-        return filter_residuals(tools, geometry, pto / "06_clean.pto", args.threshold)
+    # Our own hard backstop, off unless asked for: cpclean's cut is statistical
+    # and can leave a large absolute error behind on a uniformly bad stack.
+    if args.clean and args.clean_distance:
 
-    steps.append(
-        Step(
-            "Removing points with error above threshold",
-            on_done=clean_action,
-            outputs=[pto / "06_clean.pto"],
+        def clean_action() -> str | None:
+            return filter_residuals(tools, geometry1, pto / "08_residual.pto", args.threshold)
+
+        steps.append(
+            Step(
+                "Removing points with error above threshold",
+                on_done=clean_action,
+                outputs=[pto / "08_residual.pto"],
+            )
+            if args.force or not (pto / "08_residual.pto").exists()
+            else Step(
+                "Removing points with error above threshold",
+                note="Exists: 08_residual.pto - skipping",
+            )
         )
-        if args.force or not (pto / "06_clean.pto").exists()
-        else Step(
-            "Removing points with error above threshold", note="Exists: 06_clean.pto - skipping"
-        )
-    )
+    geometry2_src = pto / "08_residual.pto" if (args.clean and args.clean_distance) else geometry1
 
     steps.append(
         checkpoint(
             "Optimising positions again",
-            pto / "07_geometry2.pto",
+            pto / "09_geometry2.pto",
             lambda dst: Step(
                 "Optimising positions again",
-                [tools["autooptimiser"], "-p", "-o", dst, pto / "06_clean.pto"],
-                on_done=lambda: residual_stats(tools, pto / "07_geometry2.pto"),
+                [tools["autooptimiser"], "-p", "-o", dst, geometry2_src],
+                on_done=lambda: residual_stats(tools, pto / "09_geometry2.pto"),
             ),
         )
     )
-    need08 = args.force or not (pto / "08_preview.pto").exists()
-    straighten_tmp = pto / "08_straight_tmp.pto"
-    yaw_tmp = pto / "08a_yaw.pto"
-    if args.straighten and need08:
+    need_preview = args.force or not (pto / "12_preview.pto").exists()
+    straighten_tmp = pto / "10_straight.pto"
+    yaw_tmp = pto / "11_yaw.pto"
+    if args.straighten and need_preview:
         steps.append(
             Step(
                 "Straightening",
@@ -747,7 +1082,7 @@ def build(tools: dict, frames: list[Path], outdir: Path, args) -> RunPlan:
                     "-o",
                     straighten_tmp,
                     "--straighten",
-                    pto / "07_geometry2.pto",
+                    pto / "09_geometry2.pto",
                 ],
             )
         )
@@ -756,25 +1091,28 @@ def build(tools: dict, frames: list[Path], outdir: Path, args) -> RunPlan:
         straighten_tmp.unlink(missing_ok=True)
         return None
 
-    yaw_src = straighten_tmp if (args.straighten and need08) else pto / "07_geometry2.pto"
+    yaw_src = straighten_tmp if (args.straighten and need_preview) else pto / "09_geometry2.pto"
     steps.append(
         Step(
             "Centering (yaw)",
             [tools["pano_modify"], "-o", yaw_tmp, "--center", f"--projection={proj}", yaw_src],
-            on_done=cleanup_tmp if (args.straighten and need08) else None,
+            on_done=cleanup_tmp if (args.straighten and need_preview) else None,
             outputs=[yaw_tmp],
         )
-        if need08
-        else Step("Centering (yaw)", note="Exists: 08_preview.pto - skipping")
+        if need_preview
+        else Step("Centering (yaw)", note="Exists: 12_preview.pto - skipping")
     )
 
     # Final aim: the scripted equivalent of dragging the view up/down in Hugin's
     # GL preview. pano_modify --center only centres yaw, so the images' mean
-    # pitch is removed here with an explicit rotation.
+    # pitch is removed here with an explicit rotation - but only when nothing
+    # else has aimed the view: with vertical lines in the fit, the fit has
+    # already put the world's vertical where it belongs, and rotating the
+    # panorama again would tilt it away from there.
     def center_step(dst: Path) -> Step:
         def cmd() -> list:
             argv = [tools["pano_modify"], "-o", dst]
-            if args.center:
+            if args.center and not _t1_lines(yaw_tmp):
                 pm = mean_pitch(yaw_tmp)
                 if abs(pm) > 0.005:
                     argv += ["--rotate", f"0,{-pm:.5f},0"]
@@ -783,25 +1121,35 @@ def build(tools: dict, frames: list[Path], outdir: Path, args) -> RunPlan:
 
         return Step("Centering and cropping", cmd_fn=cmd)
 
-    steps.append(checkpoint("Centering and cropping", pto / "08_preview.pto", center_step))
+    steps.append(checkpoint("Centering and cropping", pto / "12_preview.pto", center_step))
 
     def size_step(dst: Path) -> Step:
         return Step(
             "Calculating output size",
-            [tools["pano_modify"], "-o", dst, "--canvas=AUTO", *ldr, pto / "08_preview.pto"],
+            [tools["pano_modify"], "-o", dst, "--canvas=AUTO", *ldr, pto / "12_preview.pto"],
             outputs=[dst],
         )
 
     steps.append(
-        size_step(pto / "09_sized.pto")
-        if args.force or not (pto / "09_sized.pto").exists()
-        else Step("Calculating output size", note="Exists: 09_sized.pto - skipping")
+        size_step(pto / "13_sized.pto")
+        if args.force or not (pto / "13_sized.pto").exists()
+        else Step("Calculating output size", note="Exists: 13_sized.pto - skipping")
     )
+
+    # A report, not a gate: the lines cpclean kept should now agree with each
+    # other to within a few tenths of a degree.
+    if args.do_lines:
+        steps.append(
+            Step(
+                "Checking line verticality",
+                on_done=lambda: line_tilt_report(tools, pto / "13_sized.pto"),
+            )
+        )
 
     steps.append(
         Step(
             "Checking image paths",
-            on_done=check_images_action(pto / "09_sized.pto", frames[0].parent),
+            on_done=check_images_action(pto / "13_sized.pto", frames[0].parent),
             quiet=True,
         )
     )
@@ -831,7 +1179,7 @@ def build(tools: dict, frames: list[Path], outdir: Path, args) -> RunPlan:
                 tools["hugin_executor"],
                 "--stitching",
                 f"--prefix={stitch_prefix}",
-                pto / "09_sized.pto",
+                pto / "13_sized.pto",
             ],
         )
         if args.force or not stitch_outputs()
@@ -853,7 +1201,7 @@ def build(tools: dict, frames: list[Path], outdir: Path, args) -> RunPlan:
                 "--output-uncropped-tiff",
                 "--ldr-file=TIFF",
                 "--ldr-compression=LZW",
-                pto / "09_sized.pto",
+                pto / "13_sized.pto",
             ]
 
         steps.append(Step("Preparing aligned frames", cmd_fn=remap_step, outputs=[remap_pto]))
@@ -915,11 +1263,12 @@ def collect(runplan: RunPlan, prefix: str) -> list[tuple[str, Path]]:
 #  Options
 # ---------------------------------------------------------------------------
 class LinesToggle(argparse.Action):
-    """-l/--lines [N] / -l filtered / --no-lines on one help line.
+    """-l/--lines [N] / --no-lines on one help line.
 
-    Bare -l uses linefind's own default count, -l N caps the kept lines at N,
-    -l filtered (or --line filtered) takes a larger candidate pool and then
-    filters it, and --no-lines skips detection.
+    Bare -l (the default) writes every line the detector keeps; -l N caps that at
+    N per frame; --no-lines skips detection.  '-l filtered' used to ask for a
+    larger linefind pool and filter it - cpclean does that now, so it is refused
+    with an explanation rather than a bare "expected an integer".
     """
 
     def __init__(self, option_strings, dest, **kwargs):
@@ -928,33 +1277,48 @@ class LinesToggle(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
         if option_string == "--no-lines":
             namespace.do_lines = False
-        elif values is True:
+            return
+        if values is True:
             namespace.do_lines = True
-            namespace.line_count = LINE_COUNT_DEFAULT
-        elif isinstance(values, str) and values.lower().startswith("filter"):
-            namespace.do_lines = True
-            namespace.line_filter = True
-            namespace.line_count = LINE_COUNT_FILTERED
-        else:
-            try:
-                count = int(values)
-            except (TypeError, ValueError) as err:
-                raise argparse.ArgumentError(
-                    self, f"expected an integer or 'filtered', got {values!r}"
-                ) from err
-            if count < 1:
-                raise argparse.ArgumentError(self, "count must be >= 1")
-            namespace.do_lines = True
-            namespace.line_count = count
+            namespace.line_count = None
+            return
+        if isinstance(values, str) and values.lower().startswith("filter"):
+            raise argparse.ArgumentError(
+                self,
+                "'-l filtered' was removed: every detected line is now written and"
+                " cpclean drops the ones that disagree (see --clean-sigma)",
+            )
+        try:
+            count = int(values)
+        except (TypeError, ValueError) as err:
+            raise argparse.ArgumentError(
+                self, f"expected a whole number of lines, got {values!r}"
+            ) from err
+        if count < 1:
+            raise argparse.ArgumentError(self, "count must be >= 1")
+        namespace.do_lines = True
+        namespace.line_count = count
 
 
 def add_arguments(sub) -> None:
     """Register Pano's own options on its subcommand parser."""
     sub.add_argument(
+        "--clean-distance",
+        "--no-clean-distance",
+        dest="clean_distance",
+        action=core.Toggle,
+        off=["--no-clean-distance"],
+        default=False,
+        help="also drop control points further than --threshold apart in the panorama"
+        " (default: off; cpclean's statistical cut is the primary cleaner)",
+    )
+    sub.add_argument(
         "--threshold",
         type=float,
         default=3.0,
-        help="drop control points with a residual above this many pixels (default: 3)",
+        metavar="PX",
+        help="the distance --clean-distance drops control points beyond, in pixels"
+        " (default: 3; unused unless --clean-distance is given)",
     )
     sub.add_argument(
         "-l",
@@ -964,11 +1328,19 @@ def add_arguments(sub) -> None:
         dest="do_lines",
         action=LinesToggle,
         metavar="N",
-        help="detect vertical lines with linefind (default: on, 5 of them);"
-        " '-l N' keeps at most N, '-l filtered' takes a larger candidate pool and"
-        " keeps only the lines that agree with each other, --no-lines skips them",
+        help="detect vertical lines and write them as control points (default: on,"
+        " every line the detector keeps); '-l N' caps that at N per frame,"
+        " --no-lines skips detection",
     )
-    sub.set_defaults(line_count=LINE_COUNT_DEFAULT, line_filter=False)
+    sub.set_defaults(line_count=None)
+    sub.add_argument(
+        "--line-min-length",
+        type=float,
+        metavar="FRACTION",
+        default=LINE_MIN_FRACTION,
+        help="ignore line segments shorter than this share of the frame's long side"
+        " (default: 0.01, i.e. 1%%)",
+    )
     sub.add_argument(
         "-s",
         "--straighten",
@@ -977,7 +1349,9 @@ def add_arguments(sub) -> None:
         action=core.Toggle,
         off=["--no-straighten"],
         default=False,
-        help="level the horizon when centering (default: off; pairs well with --lines)",
+        help="also level the panorama with Hugin's straighten, from its lines"
+        " (default: off - the vertical lines already level the fit, and straighten"
+        " was measured to add a fraction of a degree of roll on top)",
     )
     sub.add_argument(
         "-c",

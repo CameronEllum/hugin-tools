@@ -15,8 +15,8 @@ from .core import UI
 
 FUSE_DESCRIPTION = (
     "Fuse - align and fuse a stack of frames to reduce noise. "
-    "Produces sharpened JPEGs (mean / winsor / median / clean / action), an optional "
-    "animated GIF, and keeps every intermediate in <outdir>/.hugin_tools unless -k."
+    "Produces sharpened JPEGs (mean / winsor / median / motion-clean / motion-action), "
+    "an optional animated GIF, and keeps every intermediate in <outdir>/.hugin_tools unless -k."
 )
 
 PANO_DESCRIPTION = (
@@ -83,6 +83,25 @@ def _common_parser() -> argparse.ArgumentParser:
         dest="keep_ptos",
         action="store_true",
         help="keep the .pto project files",
+    )
+    common.add_argument(
+        "--clean",
+        "--no-clean",
+        dest="clean",
+        action=core.Toggle,
+        off=["--no-clean"],
+        default=True,
+        help="remove wrong control points with cpclean, both before and after the fit"
+        " (default: on; --no-clean keeps every control point cpfind found)",
+    )
+    common.add_argument(
+        "--clean-sigma",
+        type=core.positive_float,
+        metavar="N",
+        default=3.0,
+        help="cleaning: remove a control point when its error is more than this many"
+        " standard deviations above the mean (cpclean's own knob; default: 3)"
+        " - ignored with --no-clean",
     )
     common.add_argument("--log", default=None, help="also write a transcript to this file")
     common.add_argument("--no-color", action="store_true", help="disable coloured output")

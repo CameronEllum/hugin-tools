@@ -24,13 +24,20 @@ kinds, or -d/--develop to keep everything and turn on verbose logging.
 
 Moving parts
 ------------
-    --clean  : leave the moving part out, keeping the noise reduction of the
-               mean over the frames that did see background there.
-    --action : composite every detected instance back at full opacity.
+    --motion-clean : leave the moving part out, keeping the noise reduction of
+                     the mean over the frames that did see background there.
+    --motion-action: composite every detected instance back at full opacity.
 
 Both come from one detection pass.  Fine-tune with --mask-z, --mask-min-area,
 --mask-dilate, --mask-feather; --overlays (implied by -d) keeps the masks and a
 check sheet for inspection.
+
+Control points
+--------------
+The manual engine cleans its matches with cpclean before the first fit and again
+between the two fits.  --no-clean skips both passes and hands cpfind's output
+straight to the optimiser; --clean-sigma sets how far out a point has to be
+before cpclean drops it (mean + sigma standard deviations).
 
 Alignment engines
 -----------------
@@ -502,15 +509,23 @@ MERGE_TYPES = {
 
 
 def manual_steps(
-    tools: dict, frames: list[Path], aligned_dir: Path, motion: str, photometric: bool
+    tools: dict,
+    frames: list[Path],
+    aligned_dir: Path,
+    motion: str,
+    photometric: bool,
+    cleaning: bool = True,
+    sigma: float = 3.0,
 ) -> list[Step]:
-    """The original Hugin pipeline."""
+    """The original Hugin pipeline.
+
+    With cleaning on, cpclean drops statistically wrong control points before the
+    first fit and again between the two fits, both at the same sigma factor; with
+    --no-clean both passes are skipped and everything cpfind found is optimised.
+    """
     t = tools
-    img, cps, clean = (
-        aligned_dir / "images.pto",
-        aligned_dir / "control_points.pto",
-        aligned_dir / "cleaned.pto",
-    )
+    img, cps = aligned_dir / "images.pto", aligned_dir / "control_points.pto"
+    clean, refined = aligned_dir / "cleaned.pto", aligned_dir / "cleaned_again.pto"
     s0, s1, s2 = aligned_dir / "stack0.pto", aligned_dir / "stack1.pto", aligned_dir / "stack2.pto"
 
     steps = [
@@ -529,22 +544,42 @@ def manual_steps(
                 img,
             ],
         ),
-        # Clean BEFORE optimising so outliers don't skew the geometry.
-        Step(
-            "Removing bad matches",
-            [t["cpclean"], "--whole-pano-checking", f"--output={clean}", cps],
-        ),
     ]
+
+    matches = cps
+    if cleaning:
+        # Clean BEFORE optimising so outliers don't skew the geometry.
+        steps.append(
+            Step(
+                "Removing bad matches",
+                [
+                    t["cpclean"],
+                    "--whole-pano-checking",
+                    f"--max-distance={sigma:g}",
+                    f"--output={clean}",
+                    cps,
+                ],
+            )
+        )
+        matches = clean
 
     opt = "y,p,r" if motion == "low" else "y,p,r,TrX,TrY,TrZ,v"
     steps.append(
-        Step("Choosing alignment parameters", [t["pto_var"], "--opt", opt, "-o", s0, clean])
+        Step("Choosing alignment parameters", [t["pto_var"], "--opt", opt, "-o", s0, matches])
     )
-    steps += [
-        Step("Optimising alignment (pass 1)", [t["autooptimiser"], "-n", "-o", s1, s0]),
-        Step("Refining matches", [t["cpclean"], f"--output={s1}", "--max-distance=3.3", s1]),
-        Step("Optimising alignment (pass 2)", [t["autooptimiser"], "-n", "-o", s2, s1]),
-    ]
+    steps.append(Step("Optimising alignment (pass 1)", [t["autooptimiser"], "-n", "-o", s1, s0]))
+    second = s1
+    if cleaning:
+        steps.append(
+            Step(
+                "Refining matches",
+                [t["cpclean"], f"--output={refined}", f"--max-distance={sigma:g}", s1],
+            )
+        )
+        second = refined
+    steps.append(
+        Step("Optimising alignment (pass 2)", [t["autooptimiser"], "-n", "-o", s2, second])
+    )
     if photometric:
         steps.append(
             Step(
@@ -749,7 +784,15 @@ def build(tools: dict, frames: list[Path], outdir: Path, args) -> RunPlan:
         elif mode == "ais":
             steps = ais_steps(tools, frames, aligned_dir)
         else:
-            steps = manual_steps(tools, frames, aligned_dir, args.motion, args.photometric)
+            steps = manual_steps(
+                tools,
+                frames,
+                aligned_dir,
+                args.motion,
+                args.photometric,
+                args.clean,
+                args.clean_sigma,
+            )
 
         steps += output_steps(
             tools,
@@ -833,7 +876,8 @@ def add_arguments(sub) -> None:
         "--all",
         dest="all_outputs",
         action=AllOutputsAction,
-        help="produce every output type: mean, winsor, median, clean, action, animation",
+        help="produce every output type: mean, winsor, median, motion-clean,"
+        " motion-action, animation",
     )
     for flag, dest, helptext in (
         ("--mean", "do_mean", "produce the mean merge (default: off)"),
@@ -843,9 +887,14 @@ def add_arguments(sub) -> None:
             "produce the winsorised-mean merge (the default when nothing else is named)",
         ),
         ("--median", "do_median", "produce the median merge (default: off)"),
-        ("--clean", "do_clean", "fuse with whatever moved between frames excluded (default: off)"),
         (
-            "--action",
+            "--motion-clean",
+            "do_clean",
+            "fuse with whatever moved between frames excluded (default: off;"
+            " was --clean, which now belongs to control-point cleaning)",
+        ),
+        (
+            "--motion-action",
             "do_action",
             "fuse every detected moving instance back in, one per frame (default: off)",
         ),

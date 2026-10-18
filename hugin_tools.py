@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.14"
-# dependencies = ["rich", "rich-argparse", "numpy", "scipy", "tifffile", "imagecodecs", "pillow"]
+# dependencies = [
+#     "rich",
+#     "rich-argparse",
+#     "numpy",
+#     "scipy",
+#     "tifffile",
+#     "imagecodecs",
+#     "pillow",
+#     "opencv-python-headless",
+# ]
 # ///
 """
 hugin_tools - one command for the Fuse and Pano Hugin workflows.

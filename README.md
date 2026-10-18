@@ -8,11 +8,14 @@ command, sharing a common core (`hugin_tools/`).
 
 - [uv](https://docs.astral.sh/uv/) (runs the tool and its Python dependencies)
 - Hugin's command-line tools (`pto_gen`, `cpfind`, `cpclean`, `pto_var`,
-  `autooptimiser`, `linefind`, `pano_modify`, `pano_trafo`, `hugin_executor`,
+  `autooptimiser`, `pano_modify`, `pano_trafo`, `hugin_executor`,
   `align_image_stack`, `hugin_stacker`) on `PATH`
 - ImageMagick (`magick`/`convert`) — optional; needed for JPEGs and GIFs
 - exiftool — optional; copies metadata onto the outputs
 - Python 3.14+
+
+The Python side (rich, numpy, scipy, Pillow, OpenCV) comes from the script header
+in `hugin_tools.py`; uv installs it, so there is nothing else to set up.
 
 ## Usage
 
@@ -42,12 +45,18 @@ for the full option lists.
 | `-i/--input`, `IMAGE...` | image files, glob patterns, or a folder (default: this folder) |
 | `-o/--outdir` | output folder (default: current folder) |
 | `--scratch DIR` | where intermediates go (default: `<outdir>/.hugin_tools`) |
+| `--clean` / `--no-clean` | clean control points with cpclean (default: on) |
+| `--clean-sigma N` | drop a control point when its error is more than this many standard deviations above the mean (cpclean's own statistic; default: 3) |
 | `-f/--force` | redo work even if its output already exists |
 | `-k/--keep` | keep the scratch folder (every intermediate) |
 | `--keep-aligned` / `--keep-merged` / `--keep-ptos` | keep individual kinds |
 | `--overlays` | write the detection check sheets (mask / line overlays) and keep them |
 | `-d/--develop` | keep every intermediate and overlay, and enable verbose logging |
 | `-v/--verbose`, `--log FILE`, `--no-color` | transcript controls |
+
+Both tools clean their control points the same way: cpclean removes the ones that
+disagree with the rest, and `--clean-sigma` sets how far out a point has to be
+before it goes. `--no-clean` keeps every control point the detector found.
 
 ## Intermediates and the scratch folder
 
@@ -65,36 +74,46 @@ succeeded or failed. Keep it to inspect or to resume:
 ## Fuse specifics
 
 - `--aligner {ais,manual,all}`, `--motion {high,low}`, `--photometric`
-- outputs: `--mean`, `--winsor` (default), `--median`, `--clean`, `--action`,
-  `--animation`/`--gif`; or `--all` for everything. Naming any output selects
-  exactly those.
+- outputs: `--mean`, `--winsor` (default), `--median`, `--motion-clean`,
+  `--motion-action`, `--animation`/`--gif`; or `--all` for everything. Naming any
+  output selects exactly those.
+- `--motion-clean` leaves whatever moved between frames out of the fusion;
+  `--motion-action` composites every detected instance back in.
 - `--mask-z`, `--mask-min-area`, `--mask-dilate`, `--mask-feather` tune motion
   detection.
 
 ## Pano specifics
 
-- `--threshold`, `-l/--lines [N|filtered]`, `--line`, `--no-lines`
-- `-s/--straighten`, `-c/--center`, `-p/--projection`, `--format`, `--prefix`
+- `-l/--lines [N]`, `--line`, `--no-lines` — vertical-line detection, on by
+  default with no cap on how many lines a frame contributes
+- `--line-min-length FRACTION` — the shortest segment worth keeping, as a share
+  of the frame's long side (default: 0.01)
+- `--clean-distance` / `--no-clean-distance`, `--threshold PX` — an extra,
+  off-by-default hard cut on how far apart a pair may land in the panorama
+- `-s/--straighten` (off by default), `-c/--center`
+- `-p/--projection`, `--format`, `--prefix`
 - `--aligned` renders the remapped frames (off by default; `-d` implies on)
 
-## Changes from the standalone `fuse.py` / `pano.py`
-
-The two scripts were merged into one command with a shared core:
-
-- `fuse.py` → `hugin_tools fuse`, `pano.py` → `hugin_tools pano` (the `.bat`
-  shims cover this)
-- `--masks` (Fuse) and `--line-overlays` (Pano) are now the shared `--overlays`
-- intermediates moved from the output folder into `<outdir>/.hugin_tools`
-  (Pano's numbered `.pto` files included), swept unless kept
-- new shared keep options: `-k/--keep`, `--keep-aligned`, `--keep-merged`,
-  `--keep-ptos`
-- Pano's `--aligned` now defaults **off** (`-d` implies on)
-- `--keep-aligned` / `--keep-merged-tifs` (Fuse) are now the shared keep options
+Vertical lines are found with OpenCV's LSD and then checked against the vanishing
+point they must share: the longest segments propose candidate points, each is
+scored by the total length of the segments that agree with it, and only the
+winner's bundle is written into the project as `t1` control points. Hugin's own
+`linefind` is deliberately not used — "looks vertical in the picture" is not the
+same as vertical in the world once the camera is pitched or rolled, while a
+leaning edge can look perfectly upright. Because a `t1` line pins an image's roll
+to the world's vertical, the fit levels the panorama by itself, so Hugin's
+`--straighten` stays off: measured on the test panorama it only added about half a
+degree of roll on top. Without lines, the view is aimed from the camera's own
+pitch, as before. The last step reports how vertical the lines came out.
 
 ## Development
 
 ```
 uvx ruff check .        # lint
 uvx ruff format .       # format
-uvx --with pytest pytest # tests
+uvx --with pytest --with numpy --with opencv-python-headless --with pillow pytest
 ```
+
+The line-detector tests skip themselves when numpy, OpenCV or Pillow are missing,
+so a plain `uvx --with pytest pytest` also passes; the full line above exercises
+them.
