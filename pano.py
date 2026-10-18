@@ -43,6 +43,7 @@ Notes / known gaps (this is a start, not a drop-in for every pano):
 
 import argparse
 import ctypes
+import glob
 import locale
 import math
 import os
@@ -162,7 +163,7 @@ class UI:
         self,
         title: str,
         count: int,
-        source: Path,
+        source: Path | str,
         frames: list[Path],
         extra: list[str] | None = None,
         anchor: Path | None = None,
@@ -273,39 +274,65 @@ def resolve_tools() -> dict:
 IMAGE_EXTS = {".jpg", ".jpeg"}
 
 
-def collect_frames(source: Path, out_prefix: str | None) -> tuple[list[Path], list[Path]]:
-    """Top-level jpgs in a folder, sorted by name. Middle frame listed first.
+def is_image(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in IMAGE_EXTS
 
-    Listing the middle frame first is what makes it the anchor: pair-wise
+
+def is_our_output(path: Path, out_prefix: str | None) -> bool:
+    """This tool's own stitch outputs, which are never input frames.
+
+    Anything ending in a projection tag (_equirectangular/_rectilinear, or
+    legacy _pano), plus anything starting with an explicit --prefix.
+    """
+    if re.search(r"_(pano|equirectangular|rectilinear)$", path.stem):
+        return True
+    return bool(out_prefix and path.stem.startswith(out_prefix))
+
+
+def collect_frames(
+    specs: list[str], out_prefix: str | None
+) -> tuple[list[Path], list[Path], list[str]]:
+    """Frames to stitch, from folders, files or glob patterns.
+
+    Whatever the shell hands over: a folder is read as before, a pattern the
+    shell did not expand is expanded here (cmd.exe leaves wildcards alone, unlike
+    PowerShell), and explicit files are taken as given.  Sorted by name, because
+    the middle frame is listed first and becomes the anchor: pair-wise
     optimisation (autooptimiser -p) starts from the first image.
 
-    Returns (frames, skipped) without printing, so the caller can show the
-    program header first and the operation metadata afterwards.
+    Returns (frames, skipped, unmatched) - skipped are previous stitch outputs,
+    unmatched are names that matched nothing or are not jpgs, so the caller can
+    say so rather than quietly use fewer frames.
     """
-    if not source.is_dir():
-        raise SystemExit(f"Source folder not found: {source}")
+    frames: list[Path] = []
+    skipped: list[Path] = []
+    unmatched: list[str] = []
+    for spec in specs:
+        text = str(spec)
+        path = Path(text)
+        if path.is_dir():
+            found = [p for p in sorted(path.iterdir(), key=lambda p: p.name) if is_image(p)]
+        elif glob.has_magic(text):
+            found = [Path(m) for m in sorted(glob.glob(text, recursive=True)) if is_image(Path(m))]
+        elif is_image(path):
+            found = [path]
+        else:
+            found = []
+        if not found:
+            unmatched.append(text)
+        for p in found:
+            (skipped if is_our_output(p, out_prefix) else frames).append(p.resolve())
 
-    frames, skipped = [], []
-    for p in sorted(source.iterdir(), key=lambda p: p.name):
-        if not p.is_file() or p.suffix.lower() not in IMAGE_EXTS:
-            continue
-        # Skip this tool's own stitch outputs on re-runs in the same folder:
-        # anything ending in a projection tag (_equirectangular/_rectilinear,
-        # or legacy _pano), plus anything starting with an explicit --prefix.
-        if re.search(r"_(pano|equirectangular|rectilinear)$", p.stem) or (
-            out_prefix and p.stem.startswith(out_prefix)
-        ):
-            skipped.append(p)
-            continue
-        frames.append(p)
-
+    frames = sorted(dict.fromkeys(frames), key=lambda p: p.name)
     if len(frames) < 2:
-        raise SystemExit(f"Need at least 2 jpgs to stitch, found {len(frames)} in: {source}")
+        raise SystemExit(
+            f"Need at least 2 jpgs to stitch, found {len(frames)} in: " + ", ".join(specs)
+        )
 
     # Rotate so the middle frame comes first -> it becomes the anchor.
     mid = len(frames) // 2
     frames = [frames[mid]] + frames[:mid] + frames[mid + 1 :]
-    return frames, skipped
+    return frames, skipped, unmatched
 
 
 # ---------------------------------------------------------------------------
@@ -1163,12 +1190,18 @@ def main() -> int:
         formatter_class=_HELP_FORMATTER,
     )
     ap.add_argument(
+        "images",
+        nargs="*",
+        metavar="IMAGE",
+        help="frames to stitch: jpg files, glob patterns, or a folder (default: this folder)",
+    )
+    ap.add_argument(
         "-i",
         "--input",
         dest="source",
         metavar="INPUT",
         default=None,
-        help="folder with the input jpgs (default: current folder)",
+        help="frames to stitch, as with IMAGE above (default: the current folder)",
     )
     ap.add_argument(
         "-o",
@@ -1261,18 +1294,20 @@ def main() -> int:
     run_start = time.time()
     try:
         tools = resolve_tools()
-        # Resolve everything up front, then run from inside the source folder
-        # so bare image names in projects always resolve, wherever we were
-        # invoked from.
-        source = Path(args.source).resolve() if args.source else Path.cwd()
+        # Resolve everything up front, then run from inside the frames' folder so
+        # bare image names in projects always resolve, wherever we were invoked
+        # from.  With names from more than one folder, use their common parent
+        # when there is one and stay put otherwise.
         outdir = Path(args.outdir).resolve() if args.outdir else Path.cwd()
         if args.log:
             args.log = str(Path(args.log).resolve())
-        if not source.is_dir():
-            raise SystemExit(f"Source folder not found: {source}")
-        os.chdir(source)
+        specs = [*args.images, *([args.source] if args.source else [])] or [str(Path.cwd())]
 
-        frames, skipped = collect_frames(source, args.prefix)
+        frames, skipped, unmatched = collect_frames(specs, args.prefix)
+
+        parents = {p.parent for p in frames}
+        if len(parents) == 1:
+            os.chdir(parents.pop())
 
         extra: list[str] = []
         if skipped:
@@ -1281,7 +1316,13 @@ def main() -> int:
             extra.append(
                 f"[yellow]Ignored {len(skipped)} previous pano output(s): {names}{more}[/yellow]"
             )
-        ui.header("Pano", len(frames), source, frames, extra, anchor=frames[0])
+        if unmatched:
+            names = ", ".join(unmatched[:5])
+            more = f" (+{len(unmatched) - 5} more)" if len(unmatched) > 5 else ""
+            extra.append(f"[yellow]No image matched: {names}{more}[/yellow]")
+
+        where = specs[0] if len(specs) == 1 else " ".join(specs)
+        ui.header("Pano", len(frames), where, frames, extra, anchor=frames[0])
 
         # Default output name mirrors Fuse: <last frame>_<projection>.<ext>,
         # tagged with that frame's metadata (plus the anchor frame's, last winning).
