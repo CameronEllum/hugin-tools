@@ -53,7 +53,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import core
+from . import core, vision
 from .core import RunPlan, Step, scratch_dir
 
 # ---------------------------------------------------------------------------
@@ -475,25 +475,27 @@ def run_motion_fusion(
             image.thumbnail((1600, 1600))  # small enough to flip through
             image.save(masks_dir / f"{src.stem}_overlay.jpg", quality=88)
 
-    report = (
-        f"{found} moving instance(s) over {n} frames; masks cover "
-        + "/".join(f"{c:.2f}%" for c in coverage)
-        + f" of each frame, grown by {motion.dilate}px"
-        + f", blobs under {min_area}px dropped"
-    )
-    if masks_dir is not None:
-        report += f"; masks and red overlays in {masks_dir.name}"
+    # A one-line, actionable summary: what was found, and which knob to turn if it
+    # looks wrong.  The per-frame percentages are collapsed to a range, and the
+    # raw tunables only appear when the masks are kept for inspection.
+    if found == 0:
+        report = "No movement found - clean and action would match a plain merge"
+    else:
+        report = f"{found} moving instance(s), {min(coverage):.1f}-{max(coverage):.1f}% of a frame"
     if unlike_frames:
         report += (
-            "; WARNING: frame(s) "
-            + ", ".join(str(i) for i in unlike_frames)
-            + " unlike the rest (softer or exposed differently?) - a broad mask there"
-            " is that frame, not movement"
+            f"; frame(s) {', '.join(map(str, unlike_frames))} differ from the rest -"
+            " their mask is probably shake or exposure, not movement: raise --mask-z"
+            " to suppress it"
         )
-    if found == 0:
-        report += " - nothing moved, so clean and action match a plain mean"
     elif max(coverage) > 10.0:
-        report += " - WARNING: that is a lot of the frame; check --mask-z or the stack"
+        report += (
+            f"; masks reach {max(coverage):.0f}% of a frame - raise --mask-z if that is too much"
+        )
+    if masks_dir is not None:
+        report += (
+            f"; masks and red overlays in {masks_dir.name}/ (--mask-z, --mask-dilate tune them)"
+        )
     return report
 
 
@@ -757,6 +759,54 @@ def output_steps(
     return steps
 
 
+MAX_REVIEW_OUTPUTS = 3
+
+# Each fused output is judged differently, so it carries its own question (see
+# vision.FUSE_ACTION_QUESTION and friends).
+OUTPUT_KINDS = {
+    "action": ("action composite", vision.FUSE_ACTION_QUESTION),
+    "clean": ("clean plate", vision.FUSE_CLEAN_QUESTION),
+    "mean": ("fused frame (mean)", vision.FUSE_FRAME_QUESTION),
+    "winsor": ("fused frame (winsorised mean)", vision.FUSE_FRAME_QUESTION),
+    "median": ("fused frame (median)", vision.FUSE_FRAME_QUESTION),
+}
+
+
+def _output_artifact(path: Path) -> vision.Artifact:
+    for kind, (meaning, question) in OUTPUT_KINDS.items():
+        if path.stem.endswith("_" + kind):
+            return vision.Artifact(
+                path, f"fused output ({kind}): {path.name} - {meaning}", question=question
+            )
+    return vision.Artifact(path, f"fused output: {path.name}", question=vision.FUSE_FRAME_QUESTION)
+
+
+def review_artifacts(deliver: Path, work: Path, base: str) -> list[vision.Artifact]:
+    """The fused JPEGs (motion composite first) and the motion check sheets."""
+
+    def rank(path: Path) -> int:
+        return 0 if path.stem.endswith(("_action", "_clean")) else 1
+
+    items = [
+        _output_artifact(p)
+        for p in sorted(deliver.glob(f"{base}_*.jpg"), key=lambda p: (rank(p), p.name))[
+            :MAX_REVIEW_OUTPUTS
+        ]
+    ]
+    masks = work / "masks"
+    if masks.is_dir():
+        items += [
+            vision.Artifact(
+                p,
+                f"motion check sheet: {p.name} - red is what moved",
+                question=vision.FUSE_MASK_QUESTION,
+                sheet=True,
+            )
+            for p in sorted(masks.glob("*_overlay.jpg"))
+        ]
+    return items
+
+
 def build(tools: dict, frames: list[Path], outdir: Path, args) -> RunPlan:
     """Group the steps by alignment engine ('all' runs both, each in its own folder)."""
     plan: dict[str, list[Step]] = {}
@@ -804,6 +854,19 @@ def build(tools: dict, frames: list[Path], outdir: Path, args) -> RunPlan:
             args.motion_options,
             args.do_animation,
         )
+        review = vision.review_step(
+            artifacts=lambda deliver=deliver, work=work, base=f"{frames[-1].stem}_fuse": (
+                review_artifacts(deliver, work, base)
+            ),
+            intro=lambda: (
+                f"Automated frame-stack fuse run: {len(frames)} frames aligned and fused"
+                " to reduce noise."
+            ),
+            closing=vision.FUSE_CLOSING,
+            options=getattr(args, "vision", None),
+        )
+        if review is not None:
+            steps.append(review)
         plan[mode] = steps
         scratch[mode] = work
         output_dir[mode] = deliver

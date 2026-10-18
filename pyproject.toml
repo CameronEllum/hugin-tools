@@ -10,6 +10,7 @@ select = ["E", "F", "W", "I", "UP", "B", "C4", "Q", "PLC0415"]
 # so a Pano run never pays for numpy/scipy and a Fuse run never pays for Pillow.
 "hugin_tools/fuse.py" = ["PLC0415"]
 "hugin_tools/pano.py" = ["PLC0415"]
+"hugin_tools/vision.py" = ["PLC0415"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

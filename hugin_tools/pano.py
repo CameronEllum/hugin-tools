@@ -63,7 +63,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from . import core
+from . import core, vision
 from .core import RunPlan, Step, copy_file, relpath, scratch_dir
 
 # ---------------------------------------------------------------------------
@@ -862,6 +862,27 @@ def residual_stats(tools: dict, src_pto: Path) -> str:
 # ---------------------------------------------------------------------------
 #  The plan
 # ---------------------------------------------------------------------------
+MAX_REVIEW_SHEETS = 6
+
+
+def review_artifacts(outdir: Path, prefix: str, work: Path) -> list[vision.Artifact]:
+    """The stitched panorama, then the line-detection check sheets."""
+    items = [
+        vision.Artifact(p, f"final stitch: {p.name}", question=vision.PANO_STITCH_QUESTION)
+        for p in sorted(outdir.glob(f"{prefix}*"))
+        if p.suffix.lower() in {".jpg", ".jpeg", ".tif", ".tiff", ".png"}
+    ]
+    lines = work / "lines"
+    if lines.is_dir():
+        items += [
+            vision.Artifact(
+                p, f"line check sheet: {p.name}", question=vision.PANO_SHEET_QUESTION, sheet=True
+            )
+            for p in sorted(lines.glob("*_overlay.jpg"))[:MAX_REVIEW_SHEETS]
+        ]
+    return items
+
+
 def build(tools: dict, frames: list[Path], outdir: Path, args) -> RunPlan:
     """One engine ('pano'), numbered projects written after every step."""
     outdir.mkdir(parents=True, exist_ok=True)
@@ -1240,6 +1261,29 @@ def build(tools: dict, frames: list[Path], outdir: Path, args) -> RunPlan:
             return argv
 
         steps.append(Step(f"Copying metadata from {final_frame.name}", cmd_fn=tag_step))
+
+    def review_intro() -> str:
+        sized = pto / "13_sized.pto"
+        notes = [f"Automated panorama run: {len(frames)} frames, {args.projection} output."]
+        reports = (
+            ("tool's line check", line_tilt_report),
+            ("tool's residuals", residual_stats),
+        )
+        for name, fn in reports:
+            try:
+                notes.append(f"{name}: {fn(tools, sized)}")
+            except Exception:  # noqa: BLE001 - these numbers are a bonus, not required
+                pass
+        return "\n".join(notes)
+
+    review = vision.review_step(
+        artifacts=lambda: review_artifacts(outdir, prefix, work),
+        intro=review_intro,
+        closing=vision.PANO_CLOSING,
+        options=getattr(args, "vision", None),
+    )
+    if review is not None:
+        steps.append(review)
 
     return RunPlan(
         plan={"pano": steps},

@@ -353,6 +353,7 @@ STEP_ICONS: tuple[tuple[str, str], ...] = (
     ("Centering", "🧭"),
     ("Straightening", "↔️"),
     ("Skipping", "⏩"),
+    ("Reviewing result", "🔎"),
     ("Checking", "🔍"),
     ("ImageMagick not found", "⚠️"),
     ("Copying metadata", "🏷️"),

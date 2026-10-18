@@ -10,7 +10,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import core, fuse, pano
+from . import core, fuse, pano, vision
 from .core import UI
 
 FUSE_DESCRIPTION = (
@@ -118,6 +118,56 @@ def _common_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="keep every intermediate and overlay, and enable verbose logging",
     )
+    common.add_argument(
+        "--review",
+        "--no-review",
+        dest="review",
+        action=core.Toggle,
+        off=["--no-review"],
+        default=False,
+        help="review the result with a local vision model (default: off)"
+        " - --review fails the run if the review cannot be produced;"
+        " --no-review is the explicit off",
+    )
+    common.add_argument(
+        "--vision-url",
+        default=vision.DEFAULT_URL,
+        metavar="URL",
+        help="OpenAI-compatible endpoint of the local vision model (default: %(default)s)",
+    )
+    common.add_argument(
+        "--vision-model",
+        default=None,
+        metavar="NAME",
+        help="model to review with (default: the first loaded vision model at --vision-url)",
+    )
+    common.add_argument(
+        "--vision-context",
+        type=int,
+        default=None,
+        metavar="TOKENS",
+        help="context window to size the images to (default: read from the server, else 8192)",
+    )
+    common.add_argument(
+        "--vision-detail",
+        choices=["low", "balanced", "high"],
+        default="balanced",
+        help="how much image detail to send (default: balanced)",
+    )
+    common.add_argument(
+        "--vision-timeout",
+        type=float,
+        default=120.0,
+        metavar="SECONDS",
+        help="how long to wait for the model (default: %(default)s)",
+    )
+    common.add_argument(
+        "--vision-max-tokens",
+        type=int,
+        default=512,
+        metavar="N",
+        help="cap on the reply length (default: %(default)s)",
+    )
     return common
 
 
@@ -163,6 +213,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.develop:
         args.verbose = True
         ui.verbose = True
+
+    args.vision = vision.Options(
+        mode=args.review,
+        url=args.vision_url,
+        model=args.vision_model,
+        context=args.vision_context,
+        detail=args.vision_detail,
+        timeout=args.vision_timeout,
+        max_tokens=args.vision_max_tokens,
+    )
 
     outdir = Path(args.outdir).resolve() if args.outdir else Path.cwd()
     specs = [*args.images, *([args.source] if args.source else [])] or [Path.cwd()]

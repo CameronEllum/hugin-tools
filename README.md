@@ -52,7 +52,43 @@ for the full option lists.
 | `--keep-aligned` / `--keep-merged` / `--keep-ptos` | keep individual kinds |
 | `--overlays` | write the detection check sheets (mask / line overlays) and keep them |
 | `-d/--develop` | keep every intermediate and overlay, and enable verbose logging |
+| `--review` / `--no-review` | review the result with a local vision model, off by default (see below) |
 | `-v/--verbose`, `--log FILE`, `--no-color` | transcript controls |
+
+## Reviewing the result
+
+After a run, both tools can hand their own artefacts — the finished image plus
+the detection check sheets — to a **local vision model** (LM Studio, Ollama,
+llama.cpp or vLLM) and print a plain-English verdict: a broken seam, a duplicated
+band, a mask that swallowed the whole frame, a line detected on a passing car.
+It is a smoke detector for gross faults, not a pixel-peeper; the numeric reports
+(residuals, line tilts, mask coverage) remain the precise layer.
+
+```shell
+hugin_tools.bat pano                     # no review (the default)
+hugin_tools.bat pano --review            # review, and fail the run if it cannot be done
+hugin_tools.bat pano --review --vision-model qwen/qwen3-vl-8b -o "D:\out"
+```
+
+| Option | Meaning |
+|---|---|
+| `--review` / `--no-review` | off unless `--review` is given; `--review` also makes a failed review fail the run |
+| `--vision-url` | OpenAI-compatible endpoint (default `http://localhost:1234/v1`, LM Studio) |
+| `--vision-model` | model id (default: a loaded vision model at `--vision-url`) |
+| `--vision-context` | context window to size the images to (default: read from the server, else 8192) |
+| `--vision-detail {low,balanced,high}` | how much image detail to send (default `balanced`) |
+| `--vision-timeout`, `--vision-max-tokens` | how long to wait, and cap on the reply |
+
+The images are shrunk to fit the server's **loaded** context window (often far
+smaller than the model's maximum), and check sheets are dropped before the
+finished output if the budget is tight. Nothing is sent unless `--review` is
+given; when it is, a review that cannot be produced fails the run.
+
+With no `--vision-model`, a loaded vision model at `--vision-url` is used,
+preferring one whose name looks like a VLM (`…-vl-…`, `…vision…`) over a larger
+general model. Thinking is switched off for the request (`reasoning_effort`) so a
+reasoning model returns a verdict instead of spending its whole reply reasoning;
+`--vision-max-tokens` (or a non-reasoning `--vision-model`) is the fallback.
 
 Both tools clean their control points the same way: cpclean removes the ones that
 disagree with the rest, and `--clean-sigma` sets how far out a point has to be
