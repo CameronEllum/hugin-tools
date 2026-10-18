@@ -1,13 +1,9 @@
 @echo off
 rem ============================================================================
-rem  pano.bat - run Pano (pano.py) on Windows via uv.
+rem  pano.bat - shim: run `hugin pano`.  Kept so existing habits keep working;
+rem  see hugin.bat for the full command.
 rem
-rem  Run it from the folder that holds your panorama jpgs, e.g.:
-rem      pano.bat                  (results in this folder)
-rem      pano.bat -i "D:\path\row" -o "D:\path\result"
-rem      pano.bat -d               (verbose logging)
-rem
-rem  All arguments are passed straight through to pano.py.
+rem  Options go after the command, e.g.:  pano.bat -d
 rem ============================================================================
 
 where uv >nul 2>nul
@@ -17,5 +13,5 @@ if errorlevel 1 (
     exit /b 1
 )
 
-uv run "%~dp0pano.py" %*
+uv run "%~dp0hugin.py" pano %*
 exit /b %errorlevel%

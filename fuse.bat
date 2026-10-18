@@ -1,15 +1,9 @@
 @echo off
 rem ============================================================================
-rem  fuse.bat - run Fuse (fuse.py) on Windows via uv.
+rem  fuse.bat - shim: run `hugin fuse`.  Kept so existing habits keep working;
+rem  see hugin.bat for the full command.
 rem
-rem  Run it from the folder that holds your images, e.g.:
-rem      fuse.bat                  (default ais aligner, results in this folder)
-rem      fuse.bat --all            (every output type, motion included)
-rem      fuse.bat --aligner all    (run manual and ais into sub-folders)
-rem      fuse.bat -d               (keep everything + verbose logging)
-rem      fuse.bat -i "D:\path\export" -o "D:\path\out"
-rem
-rem  All arguments are passed straight through to fuse.py.
+rem  Options go after the command, e.g.:  fuse.bat --all
 rem ============================================================================
 
 where uv >nul 2>nul
@@ -19,5 +13,5 @@ if errorlevel 1 (
     exit /b 1
 )
 
-uv run "%~dp0fuse.py" %*
+uv run "%~dp0hugin.py" fuse %*
 exit /b %errorlevel%

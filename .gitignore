@@ -4,6 +4,10 @@ __pycache__/
 
 # Tooling caches
 .ruff_cache/
+.pytest_cache/
+
+# Scratch folder for intermediates
+.hugin_tools/
 
 # Virtual environments
 .venv
