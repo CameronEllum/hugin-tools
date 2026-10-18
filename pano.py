@@ -42,6 +42,7 @@ Notes / known gaps (this is a start, not a drop-in for every pano):
 """
 
 import argparse
+import ctypes
 import locale
 import math
 import os
@@ -87,8 +88,6 @@ def setup_console() -> None:
 
     if os.name == "nt":
         try:
-            import ctypes
-
             kernel32 = ctypes.windll.kernel32
             kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
         except Exception:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["rich", "rich-argparse"]
+# dependencies = ["rich", "rich-argparse", "numpy", "scipy", "tifffile", "imagecodecs", "pillow"]
 # ///
 """
 Fuse - align and fuse a stack of frames to reduce noise.
@@ -24,13 +24,37 @@ Layout of the output folder
         <name>_fuse_mean.jpg        sharpened JPEGs (the deliverables)
         <name>_fuse_winsor.jpg
         <name>_fuse_median.jpg
+        <name>_fuse_clean.jpg       the frames with moving parts excluded
+        <name>_fuse_action.jpg      every moving part composited back in
         <name>_fuse.gif
         <name>_fuse_*.tif           merged TIFFs  (deleted by default)
         aligned/                    aligned frames ("stack images"; deleted by default)
+        masks/                      the motion masks + red overlays (--masks, or -d)
 
 `<name>` is the last frame's file name, and its metadata is copied onto the outputs.
 Everything except the JPEGs/GIF is deleted by default.  Use -d/--develop to keep
 all intermediates and turn on verbose logging.
+
+Moving parts
+------------
+A subject that moves between frames is averaged into a ghost by the mean-type
+merges, and dropped altogether by the median (a pixel it occupies in fewer than
+half the frames is an outlier there).  Neither is what you want when the point
+is to show where the subject went:
+
+    --clean  : leave the moving part out, keeping the noise reduction of the
+               mean over the frames that did see background there.
+    --action : composite every detected instance back at full opacity, so a
+               gondola crossing the frame appears once per frame, not smeared.
+
+Both come from one detection pass - the stack median is the reference, and
+|frame - median| isolates whatever moved - so they cost the same together as
+apart.  Fine-tune with --mask-z, --mask-min-area, --mask-dilate, --mask-feather;
+--masks (implied by -d) keeps the masks and a check sheet for inspection.
+
+A bare run produces the winsorised mean and nothing else.  --all asks for every
+output type at once (mean, winsor, median, clean, action, animation); options are
+read left to right, so a --no-<output> after it leaves that one out again.
 
 Alignment engines
 -----------------
@@ -44,7 +68,10 @@ editor) are refused up front.  The manual engine remaps each frame onto a common
 canvas and handles mixed sizes, so use that when the frames are not identical.
 """
 
+from __future__ import annotations
+
 import argparse
+import ctypes
 import os
 import re
 import shutil
@@ -74,6 +101,13 @@ except ImportError:  # keep working (plainer) if rich is somehow unavailable
     HAVE_RICH = False
     _HELP_FORMATTER = argparse.RawDescriptionHelpFormatter
 
+# Only the motion features need these; every run gets them, because the script
+# metadata above asks uv for them.
+import numpy as np
+import tifffile
+from PIL import Image
+from scipy import ndimage as ndi
+
 
 # ---------------------------------------------------------------------------
 #  Console setup
@@ -88,8 +122,6 @@ def setup_console() -> None:
 
     if os.name == "nt":
         try:
-            import ctypes
-
             kernel32 = ctypes.windll.kernel32
             kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
         except Exception:
@@ -428,6 +460,294 @@ def check_same_size(frames: list[Path]) -> None:
 
 
 # ---------------------------------------------------------------------------
+#  Moving parts: find them against the stack median, then fuse around them
+# ---------------------------------------------------------------------------
+# A frame whose difference from the plate is far above the others' is globally
+# unlike them: soft from camera shake, or exposed differently.  It is reported,
+# never silently tolerated - widening that frame's threshold would eat the very
+# subject the mask is looking for, which is a far worse failure than a broad mask.
+UNLIKE_FRAME_RATIO = 1.5
+
+
+def run_motion_fusion(
+    aligned: list[Path],
+    out_clean: Path | None,
+    out_action: Path | None,
+    motion: MotionOptions,
+    masks_dir: Path | None = None,
+) -> str:
+    """Fuse an aligned stack so that whatever moved is excluded, or kept per frame.
+
+    The median of the stack is the reference: a pixel the subject occupies in
+    fewer than half the frames is background there, and background is what the
+    median shows, so |frame - median| isolates the subject in each frame.
+
+    out_clean   every moving pixel excluded, so the background averages only over
+                frames that really saw background there - no ghost.
+    out_action  each detected instance composited back at full opacity, in frame
+                order, onto that clean plate.
+    masks_dir   write the per-frame masks there (debug; see -d / --masks).
+
+    Returns a one-line report for the transcript.
+    """
+    n = len(aligned)
+    if n < 3:
+        raise RuntimeError(
+            f"motion masking needs at least 3 aligned frames, got {n} - with fewer,"
+            " the stack median cannot reject something that moved"
+        )
+
+    def rgb_and_valid(img):
+        """Split one frame into (RGB, validity).  nona writes RGBA canvases."""
+        if img.ndim == 2:
+            return np.repeat(img[:, :, None], 3, axis=2), np.ones(img.shape, bool)
+        if img.shape[2] == 2:  # grey + alpha
+            return np.repeat(img[:, :, :1], 3, axis=2), img[:, :, 1] > 0
+        if img.shape[2] >= 4:  # RGBA: alpha marks the remapped area, not colour
+            return img[:, :, :3], img[:, :, 3] > 0
+        return img, np.ones(img.shape[:2], bool)
+
+    frames = [tifffile.imread(p) for p in aligned]
+    shapes = {f.shape[:2] for f in frames}
+    if len(shapes) > 1:
+        raise RuntimeError(f"aligned frames are not all the same size: {sorted(shapes)}")
+
+    dtype = frames[0].dtype
+    max_val = float(np.iinfo(dtype).max)
+    parts = [rgb_and_valid(f) for f in frames]
+    shape = parts[0][0].shape
+    min_area = motion.min_area
+    if min_area <= 0:  # scale the floor with the frame so it suits any camera
+        min_area = max(300, round(0.0002 * shape[0] * shape[1]))
+
+    def channel(img, c):
+        return img[:, :, c].astype(np.float32)
+
+    # The median plate: background, with anything that moved left out of it.
+    stack = np.stack([rgb for rgb, _ in parts])
+    if n % 2:
+        middle = n // 2
+        plate = np.partition(stack, middle, axis=0)[middle].copy()
+    else:  # an even stack has no middle frame; average the two middle ones
+        plate = np.median(stack.astype(np.float32), axis=0)
+    del stack
+
+    # Photometry.  One frame in a stack is often brighter than the rest, because
+    # the light or the meter changed between shots, and left alone that whole
+    # frame reads as "moved": the sky and every flat surface light up at once.
+    # Match each frame per channel to the plate before looking for differences,
+    # and keep the matched frames for the output, so a pasted instance cannot
+    # carry a different exposure onto the plate either.
+    gains: list[list[float]] = []
+    for rgb, valid in parts:
+        frame_gain, usable = [], bool(valid.any())
+        for c in range(3):
+            level = float(channel(rgb, c)[valid].mean()) if usable else 0.0
+            reference = float(channel(plate, c)[valid].mean()) if usable else 0.0
+            want = reference / level if level > 0 else 1.0
+            frame_gain.append(min(max(want, 0.7), 1.4))  # never a wild correction
+        for c in range(3):
+            if frame_gain[c] != 1.0:
+                scaled = channel(rgb, c) * frame_gain[c]
+                np.clip(scaled, 0.0, max_val, out=scaled)
+                rgb[:, :, c] = scaled.astype(rgb.dtype)
+        gains.append(frame_gain)
+
+    open_s = ndi.iterate_structure(ndi.generate_binary_structure(2, 1), 2)
+    close_s = ndi.iterate_structure(ndi.generate_binary_structure(2, 1), 5)
+    square = np.ones((3, 3), bool)
+
+    # Where the median has real background behind it: a pixel painted by only
+    # one frame sits on a black hole in the plate otherwise, and that hole reads
+    # as a huge difference - i.e. as movement.
+    valid_stack = np.stack([valid for _, valid in parts])
+    painted = np.any(valid_stack, axis=0)
+    known = valid_stack.sum(axis=0) > n // 2
+
+    # Difference of every frame from the plate, and how unlike the others each
+    # frame is overall.  That second number is a diagnostic, not a tolerance: a
+    # globally off frame (shake, exposure) shows up as a broad mask, and it is
+    # much better to say so than to widen the threshold and lose its subject.
+    diffs: list = []
+    unlike: list[float] = []
+    for rgb, _valid in parts:
+        diff = np.zeros(rgb.shape[:2], np.float32)
+        for c in range(3):
+            np.maximum(diff, np.abs(channel(rgb, c) - channel(plate, c)), out=diff)
+        diff = ndi.gaussian_filter(diff, 2.0)
+        diff[~known] = 0.0  # no background in the plate there, so nothing to compare
+        diffs.append(diff)
+        unlike.append(float(np.median(diff)))
+
+    # How much a pixel may differ between the aligned frames without anything
+    # having moved: the stack's own disagreement there, not the scene's local
+    # texture.  Static detail is identical in every aligned frame, so a busy wall
+    # must not raise the bar above a low-contrast subject - which is exactly how
+    # a background ends up showing through a person.  Only real disagreement
+    # (sensor noise, residual misregistration, JPEG) may raise it.
+    #
+    # The median across frames is the right aggregator: a subject standing in one
+    # frame cannot move it, while several frames that sit differently - exposure
+    # drift, a touch of misregistration - can, which is what should be tolerated.
+    spread = np.empty(shape[:2], np.float32)
+    for y0 in range(0, shape[0], 256):  # banded, so the stack copy stays small
+        y1 = min(y0 + 256, shape[0])
+        band = np.stack([d[y0:y1] for d in diffs], axis=0)
+        spread[y0:y1] = np.median(band, axis=0)
+        del band
+    # Spread it a little, so one quiet pixel cannot tighten the bar for its
+    # neighbours, where the registration is really no better.
+    local = ndi.maximum_filter(spread, size=9).astype(np.float32)
+    del spread
+
+    # Two floors.  An absolute one, so flat dark areas do not divide by ~nothing,
+    # and a relative one, because a flat *bright* area (sky) has almost no spread
+    # of its own and would otherwise call any small exposure or tone-curve
+    # difference between frames a moving object.
+    mean = ndi.uniform_filter(plate.max(axis=-1).astype(np.float32), 15)
+    local = np.sqrt(local * local + (0.04 * mean) ** 2 + (0.015 * max_val) ** 2)
+    del mean
+
+    typical = float(np.median(unlike)) if unlike else 0.0
+    unlike_frames = [
+        i + 1
+        for i, u in enumerate(unlike)
+        if typical > 0 and u >= 0.005 * max_val and u / typical > UNLIKE_FRAME_RATIO
+    ]
+
+    hard: list = []  # exclusion: the pixels the subject owns in this frame
+    soft: list = []  # inclusion: the same, feathered for compositing, as uint8
+    coverage: list[float] = []
+
+    found = 0
+    for k, (_rgb, valid) in enumerate(parts):
+        diff = diffs[k]
+        diffs[k] = None  # release frame by frame: these are full-frame arrays
+        mask = (diff / local) > motion.z_thresh
+        del diff
+        mask &= valid & known  # ignore the unpainted border of the canvas
+        mask = ndi.binary_fill_holes(ndi.binary_closing(ndi.binary_opening(mask, open_s), close_s))
+        # Judge features *before* growing them: on a textured surface (stone,
+        # foliage) the residual differences of static detail are small and thin,
+        # but once dilated they merge into one huge blob and sail past the area
+        # floor.  Keep the blobs that really are a feature, plus their own
+        # smaller parts (shoes, a carriage) that sit within reach of one.
+        labels, count = ndi.label(mask)
+        if count:
+            areas = np.bincount(labels.ravel())
+            areas[0] = 0  # label 0 is the background
+            big = areas >= min_area
+            found += int(big.sum())
+            if not big.any():
+                mask[:] = False
+            else:
+                reach = ndi.binary_dilation(big[labels], square, iterations=motion.dilate)
+                mask &= reach
+        del labels
+        # Grow what is left over the subject's travel between frames and its blur
+        # within one frame.
+        grown = ndi.binary_dilation(mask, square, iterations=motion.dilate)
+        hard.append(grown)
+        feathered = ndi.gaussian_filter(grown.astype(np.float32), motion.feather)
+        soft.append(np.rint(np.clip(feathered, 0.0, 1.0) * 255.0).astype(np.uint8))
+        coverage.append(100.0 * grown.sum() / max(int(painted.sum()), 1))
+    del diffs
+
+    # Clean plate: weighted mean over the frames that saw background at a pixel.
+    acc = np.zeros(shape, np.float32)
+    weight = np.zeros(shape[:2], np.float32)
+    for (rgb, valid), masked in zip(parts, hard, strict=True):
+        w = np.logical_and(valid, ~masked).astype(np.float32)
+        for c in range(3):
+            acc[:, :, c] += channel(rgb, c) * w
+        weight += w
+    weak = weight <= 0.05  # the subject covered this pixel in every frame
+    fine = weight.copy()
+    fine[weak] = 1.0
+    acc /= fine[:, :, None]
+    if weak.any():
+        acc[weak] = plate[weak].astype(np.float32)
+
+    # The thin band only one or two frames painted: there is no averaged
+    # background to be had and the plate is a hole there, so borrow a real pixel
+    # from whichever frame has one instead of letting the edge fall to black.
+    gaps = painted & ~known
+    if gaps.any():
+        for rgb, valid in parts:
+            fill = gaps & valid
+            if fill.any():
+                acc[fill] = rgb[fill].astype(np.float32)
+                gaps &= ~fill
+
+    alpha = painted.astype(dtype) * np.iinfo(dtype).max
+
+    def write(path: Path, rgb) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        img = np.clip(np.rint(rgb), 0, max_val).astype(dtype)
+        tifffile.imwrite(path, np.dstack([img, alpha]), compression="lzw")
+
+    if out_clean is not None:
+        write(out_clean, acc)
+
+    if out_action is not None:
+        # Compose by ownership rather than by order.  Where several frames claim
+        # the same pixel - the subject's body overlapping between frames, or a
+        # mask straying onto the background - the strongest claim wins, so a
+        # later frame's static background can never be pasted over an earlier
+        # instance.  The winning alpha is then used to feather the edge against
+        # the clean plate, so interiors stay solid and boundaries stay smooth.
+        best = np.zeros(shape[:2], np.float32)
+        owner = np.zeros(shape, np.float32)
+        for (rgb, _valid), mask255 in zip(parts, soft, strict=True):
+            mask = mask255.astype(np.float32) * (1.0 / 255.0)
+            stronger = mask > best
+            if not stronger.any():
+                continue
+            for c in range(3):
+                owner[:, :, c][stronger] = channel(rgb, c)[stronger]
+            best[stronger] = mask[stronger]
+        composed = acc * (1.0 - best[:, :, None]) + owner * best[:, :, None]
+        write(out_action, composed)
+
+    if masks_dir is not None:
+        # Keep the masks themselves, plus a look-at-me version of each frame with
+        # the mask painted over it in red, the way a mask reads in Lightroom.
+        # Done here because the frames and masks are already in memory.
+        masks_dir.mkdir(parents=True, exist_ok=True)
+        red = np.array([255.0, 0.0, 0.0], np.float32)
+        for src, (rgb, _valid), mask255, masked in zip(aligned, parts, soft, hard, strict=True):
+            tifffile.imwrite(masks_dir / f"{src.stem}_mask.tif", mask255)
+            outline = masked & ~ndi.binary_erosion(masked, square, iterations=3)
+            tint = mask255.astype(np.float32) * (0.4 / 255.0)
+            over = rgb.astype(np.float32) * (1.0 - tint[:, :, None]) + red * tint[:, :, None]
+            over[outline] = over[outline] * 0.2 + red * 0.8
+            image = Image.fromarray(np.clip(over, 0, 255).astype(np.uint8))
+            image.thumbnail((1600, 1600))  # small enough to flip through
+            image.save(masks_dir / f"{src.stem}_overlay.jpg", quality=88)
+
+    report = (
+        f"{found} moving instance(s) over {n} frames; masks cover "
+        + "/".join(f"{c:.2f}%" for c in coverage)
+        + f" of each frame, grown by {motion.dilate}px"
+        + f", blobs under {min_area}px dropped"
+    )
+    if masks_dir is not None:
+        report += f"; masks and red overlays in {masks_dir.name}"
+    if unlike_frames:
+        report += (
+            "; WARNING: frame(s) "
+            + ", ".join(str(i) for i in unlike_frames)
+            + " unlike the rest (softer or exposed differently?) - a broad mask there"
+            " is that frame, not movement"
+        )
+    if found == 0:
+        report += " - nothing moved, so clean and action match a plain mean"
+    elif max(coverage) > 10.0:
+        report += " - WARNING: that is a lot of the frame; check --mask-z or the stack"
+    return report
+
+
+# ---------------------------------------------------------------------------
 #  The plan: an ordered list of steps, built up-front so the progress bar can
 #  show real progress, then executed one at a time.
 # ---------------------------------------------------------------------------
@@ -436,6 +756,7 @@ class Step:
     label: str
     cmd: list[str] | None = None
     cmd_fn: Callable[[], list[str]] | None = None  # built when the step runs
+    run_fn: Callable[[], str | None] | None = None  # in-process Python step
     note: str | None = None  # informational step: no command, just a message
     on_done: Callable[[], None] | None = None
 
@@ -446,6 +767,23 @@ MERGE_TYPES = {
     "winsor": (["--mode=winsor", "--winsor-trim=0.2"], "winsorised mean"),
     "median": (["--mode=median"], "median"),
 }
+
+
+@dataclass
+class MotionOptions:
+    """What to do about the parts of a stack that move between frames."""
+
+    clean: bool = False  # emit the plate with the moving parts excluded
+    action: bool = False  # emit the composite of every moving instance
+    masks: bool = False  # keep the masks and a check sheet
+    z_thresh: float = 3.5  # how far from the stack median a pixel must sit
+    min_area: int = 0  # drop blobs below this many pixels (0 = scale with frame)
+    dilate: int = 12  # grow each mask by this radius, in pixels
+    feather: float = 4.0  # soften the pasted edge by this sigma, in pixels
+
+    @property
+    def enabled(self) -> bool:
+        return self.clean or self.action
 
 
 def manual_steps(
@@ -565,6 +903,8 @@ def output_steps(
     merge_types: list[str],
     keep_merged: bool,
     keep_aligned: bool,
+    motion: MotionOptions,
+    animation: bool,
 ) -> list[Step]:
     """Combine / sharpen / (delete) steps for one engine's output folder."""
     base = f"{ref.stem}_fuse"
@@ -580,6 +920,31 @@ def output_steps(
             raise RuntimeError(f"No aligned frames found in {aligned_dir}")
         return found
 
+    def jpeg_steps(tif: Path) -> list[Step]:
+        """The sharpened JPEG for one merged product, plus its TIFF cleanup."""
+        if not magick:
+            # Without ImageMagick the TIFF is the only artefact there is.
+            if keep_merged:
+                return [Step(f"Merged TIFF ready: {tif.name}", note=f"kept {tif.name}")]
+            return []
+        jpg = tif.with_suffix(".jpg")
+
+        def sharpen_step(tif=tif, jpg=jpg):
+            return [magick, str(tif), "-unsharp", "0x0.7+1.0+0", "-quality", "95", str(jpg)]
+
+        # Keep the TIFF if asked, or when there is no ImageMagick to make a JPEG.
+        def delete_tif(tif=tif):
+            if tif.exists():
+                tif.unlink()
+
+        return [
+            Step(
+                f"Sharpening {jpg.name}",
+                cmd_fn=sharpen_step,
+                on_done=None if keep_merged else delete_tif,
+            )
+        ]
+
     for name in merge_types:
         extra, label = MERGE_TYPES[name]
         tif = outdir / f"{base}_{name}.tif"
@@ -588,29 +953,23 @@ def output_steps(
             return [stacker, *extra, f"--output={tif}", *[str(p) for p in aligned_frames()]]
 
         steps.append(Step(f"Combining frames ({label})", cmd_fn=combine_step))
+        steps += jpeg_steps(tif)
 
-        if magick:
-            jpg = tif.with_suffix(".jpg")
+    # Whatever moves between frames: one detection pass feeds both products.
+    if motion.enabled:
+        clean_tif = outdir / f"{base}_clean.tif" if motion.clean else None
+        action_tif = outdir / f"{base}_action.tif" if motion.action else None
+        masks_dir = outdir / "masks" if motion.masks else None
 
-            def sharpen_step(tif=tif, jpg=jpg):
-                return [magick, str(tif), "-unsharp", "0x0.7+1.0+0", "-quality", "95", str(jpg)]
+        def motion_step(clean_tif=clean_tif, action_tif=action_tif, masks_dir=masks_dir):
+            return run_motion_fusion(aligned_frames(), clean_tif, action_tif, motion, masks_dir)
 
-            # Keep the TIFF if asked, or when there is no ImageMagick to make a JPEG.
-            def delete_tif(tif=tif):
-                if tif.exists():
-                    tif.unlink()
+        steps.append(Step("Detecting motion", run_fn=motion_step))
+        for tif in (clean_tif, action_tif):
+            if tif is not None:
+                steps += jpeg_steps(tif)
 
-            steps.append(
-                Step(
-                    f"Sharpening {jpg.name}",
-                    cmd_fn=sharpen_step,
-                    on_done=None if keep_merged or not magick else delete_tif,
-                )
-            )
-        elif keep_merged:
-            steps.append(Step(f"Merged TIFF ready: {tif.name}", note=f"kept {tif.name}"))
-
-    if magick:
+    if magick and animation:
         gif = outdir / f"{base}.gif"
 
         def gif_step(gif=gif):
@@ -627,7 +986,7 @@ def output_steps(
             ]
 
         steps.append(Step(f"Building animation {gif.name}", cmd_fn=gif_step))
-    else:
+    elif not magick:
         steps.append(
             Step(
                 "ImageMagick not found - skipping JPEG/animation",
@@ -699,6 +1058,8 @@ def build_plan(tools: dict, frames: list[Path], outdir: Path, args) -> dict[str,
             args.merge_types,
             args.keep_merged,
             args.keep_aligned,
+            args.motion_options,
+            args.do_animation,
         )
         plan[mode] = steps
     return plan
@@ -721,6 +1082,7 @@ STEP_ICONS: tuple[tuple[str, str], ...] = (
     ("Aligning frames", "🎯"),
     ("Skipping alignment", "⏩"),
     ("Combining frames", "🧩"),
+    ("Detecting motion", "🏃"),
     ("Sharpening", "✨"),
     ("Building animation", "🎞️"),
     ("ImageMagick not found", "⚠️"),
@@ -737,13 +1099,20 @@ def step_icon(label: str) -> str:
     return "•"
 
 
-def execute_step(ui: UI, step: Step, console=None) -> float:
-    """Run one step's command. Returns elapsed seconds. Raises on failure."""
+def execute_step(ui: UI, step: Step, console=None) -> tuple[float, str | None]:
+    """Run one step's command or Python callable.
+
+    Returns (elapsed seconds, optional report line).  Raises on failure.
+    """
+    start = time.time()
+    if step.run_fn is not None:  # in-process step: no subprocess to supervise
+        report = step.run_fn()
+        return time.time() - start, report
+
     argv = step.cmd_fn() if step.cmd_fn is not None else step.cmd
     if ui.verbose:
         ui.cmd(argv, console)
 
-    start = time.time()
     buf: list[str] = []
     proc = subprocess.Popen(
         argv,
@@ -770,7 +1139,7 @@ def execute_step(ui: UI, step: Step, console=None) -> float:
     finally:
         if proc.stdout:
             proc.stdout.close()
-    return time.time() - start
+    return time.time() - start, None
 
 
 def run_plan(ui: UI, plan: dict[str, list[Step]]) -> int:
@@ -801,7 +1170,9 @@ def run_plan(ui: UI, plan: dict[str, list[Step]]) -> int:
                 done = 0
                 for step in steps:
                     progress.update(task, description=step.label)
-                    if step.cmd is None and step.cmd_fn is None:  # informational / action-only
+                    if (
+                        step.cmd is None and step.cmd_fn is None and step.run_fn is None
+                    ):  # informational / action-only
                         if step.on_done:
                             step.on_done()
                         ui.say(
@@ -812,7 +1183,7 @@ def run_plan(ui: UI, plan: dict[str, list[Step]]) -> int:
                         progress.advance(task)
                         continue
                     try:
-                        took = execute_step(ui, step, progress.console)
+                        took, report = execute_step(ui, step, progress.console)
                     except Exception as exc:  # noqa: BLE001 - report and continue
                         err = str(exc)
                         break
@@ -821,6 +1192,8 @@ def run_plan(ui: UI, plan: dict[str, list[Step]]) -> int:
                         f" [grey50]({took:.1f}s)[/grey50]",
                         progress.console,
                     )
+                    if report:
+                        ui.dim(report, progress.console)
                     if step.on_done:
                         step.on_done()
                     progress.advance(task)
@@ -836,7 +1209,9 @@ def run_plan(ui: UI, plan: dict[str, list[Step]]) -> int:
         for mode, steps in plan.items():
             err = None
             for step in steps:
-                if step.cmd is None and step.cmd_fn is None:  # informational / action-only
+                if (
+                    step.cmd is None and step.cmd_fn is None and step.run_fn is None
+                ):  # informational / action-only
                     if step.on_done:
                         step.on_done()
                     ui.print(
@@ -845,13 +1220,15 @@ def run_plan(ui: UI, plan: dict[str, list[Step]]) -> int:
                     )
                     continue
                 try:
-                    took = execute_step(ui, step)
+                    took, report = execute_step(ui, step)
                 except Exception as exc:  # noqa: BLE001 - report and continue
                     err = str(exc)
                     break
                 ui.print(
                     f"  {step_icon(step.label)} {escape(step.label)} [grey50]({took:.1f}s)[/grey50]"
                 )
+                if report:
+                    ui.dim(report)
                 if step.on_done:
                     step.on_done()
             if err is not None:
@@ -878,6 +1255,25 @@ class Toggle(argparse.Action):
 
     def __call__(self, parser, namespace, values, option_string=None):
         setattr(namespace, self.dest, option_string not in self._off)
+
+
+class AllOutputs(argparse.Action):
+    """--all switches on every output type at the point it appears.
+
+    Options are applied in the order they are given, so "--all --no-median"
+    produces everything except the median merge, while "--no-action --all" turns
+    the action composite back on.
+    """
+
+    OUTPUTS = ("do_mean", "do_winsor", "do_median", "do_clean", "do_action", "do_animation")
+
+    def __init__(self, option_strings, dest, **kwargs):
+        super().__init__(option_strings, dest, nargs=0, default=False, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, True)
+        for name in self.OUTPUTS:
+            setattr(namespace, name, True)
 
 
 def collect_outputs(mode_dir: Path) -> list[Path]:
@@ -984,12 +1380,18 @@ def main() -> int:
         help="keep the aligned frames in the 'aligned' subfolder (default: delete)",
     )
     ap.add_argument(
+        "--all",
+        dest="all_outputs",
+        action=AllOutputs,
+        help="produce every output type: mean, winsor, median, clean, action, animation",
+    )
+    ap.add_argument(
         "--mean",
         "--no-mean",
         dest="do_mean",
         action=Toggle,
         off=["--no-mean"],
-        default=False,
+        default=None,
         help="produce the mean merge (default: off)",
     )
     ap.add_argument(
@@ -998,8 +1400,8 @@ def main() -> int:
         dest="do_winsor",
         action=Toggle,
         off=["--no-winsor"],
-        default=True,
-        help="produce the winsorised-mean merge (default: on)",
+        default=None,
+        help="produce the winsorised-mean merge (the default when nothing else is named)",
     )
     ap.add_argument(
         "--median",
@@ -1007,8 +1409,75 @@ def main() -> int:
         dest="do_median",
         action=Toggle,
         off=["--no-median"],
-        default=False,
+        default=None,
         help="produce the median merge (default: off)",
+    )
+    ap.add_argument(
+        "--clean",
+        "--no-clean",
+        dest="do_clean",
+        action=Toggle,
+        off=["--no-clean"],
+        default=None,
+        help="fuse with whatever moved between frames excluded (default: off)",
+    )
+    ap.add_argument(
+        "--action",
+        "--no-action",
+        dest="do_action",
+        action=Toggle,
+        off=["--no-action"],
+        default=None,
+        help="fuse every detected moving instance back in, one per frame (default: off)",
+    )
+    ap.add_argument(
+        "--animation",
+        "--gif",
+        "--no-animation",
+        "--no-gif",
+        dest="do_animation",
+        action=Toggle,
+        off=["--no-animation", "--no-gif"],
+        default=None,
+        help="build the animated GIF of the aligned frames (default: off)",
+    )
+    ap.add_argument(
+        "--masks",
+        "--no-masks",
+        dest="do_masks",
+        action=Toggle,
+        off=["--no-masks"],
+        default=False,
+        help="keep the motion masks and a check sheet in 'masks' (default: off; -d implies on)",
+    )
+    ap.add_argument(
+        "--mask-z",
+        type=float,
+        metavar="Z",
+        default=3.5,
+        help="motion: how far from the stack median a pixel must sit to count (default: 3.5)",
+    )
+    ap.add_argument(
+        "--mask-min-area",
+        type=int,
+        metavar="PX",
+        default=0,
+        help="motion: ignore blobs smaller than this after growing them, in pixels"
+        " (default: 0 = auto, 0.02%% of the frame)",
+    )
+    ap.add_argument(
+        "--mask-dilate",
+        type=int,
+        metavar="PX",
+        default=12,
+        help="motion: grow each mask by this radius, in pixels (default: 12)",
+    )
+    ap.add_argument(
+        "--mask-feather",
+        type=float,
+        metavar="PX",
+        default=4.0,
+        help="motion: soften the pasted edge by this sigma, in pixels (default: 4)",
     )
     ap.add_argument(
         "-d",
@@ -1019,11 +1488,35 @@ def main() -> int:
     )
     args = ap.parse_args()
 
+    # Output selection: naming any output gives exactly the ones named, so
+    # "--action" no longer drags the default winsor along.  A run that names no
+    # output at all falls back to the winsorised mean, as it always did.
+    outputs = ("do_mean", "do_winsor", "do_median", "do_clean", "do_action", "do_animation")
+    if all(getattr(args, name) is None for name in outputs):
+        args.do_winsor = True
+    for name in outputs:
+        if getattr(args, name) is None:
+            setattr(args, name, False)
+    if not any(getattr(args, name) for name in outputs):
+        raise SystemExit(
+            "No outputs selected - every output type was switched off.\n"
+            "Name the ones you want, or use --all for everything."
+        )
     # -d/--develop implies: keep all intermediates + verbose output.
     if args.develop:
         args.keep_merged = True
         args.keep_aligned = True
         args.verbose = True
+        args.do_masks = True
+    args.motion_options = MotionOptions(
+        clean=args.do_clean,
+        action=args.do_action,
+        masks=args.do_masks,
+        z_thresh=args.mask_z,
+        min_area=args.mask_min_area,
+        dilate=args.mask_dilate,
+        feather=args.mask_feather,
+    )
     args.merge_types = [
         name
         for name, on in (
