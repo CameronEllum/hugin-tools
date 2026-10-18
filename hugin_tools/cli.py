@@ -104,8 +104,8 @@ def _common_parser() -> argparse.ArgumentParser:
 
 def _parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        prog="hugin",
-        description="hugin - Hugin command-line workflows.",
+        prog="hugin_tools",
+        description="hugin_tools - Hugin command-line workflows.",
         formatter_class=core._HELP_FORMATTER,
     )
     sub = ap.add_subparsers(dest="command", metavar="{fuse,pano}")

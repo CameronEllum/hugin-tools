@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from hugintools import pano
+from hugin_tools import pano
 
 
 def make_args(argv):

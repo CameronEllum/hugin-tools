@@ -1,7 +1,7 @@
 @echo off
 rem ============================================================================
-rem  fuse.bat - shim: run `hugin fuse`.  Kept so existing habits keep working;
-rem  see hugin.bat for the full command.
+rem  fuse.bat - shim: run `hugin_tools fuse`.  Kept so existing habits keep
+rem  working; see hugin_tools.bat for the full command.
 rem
 rem  Options go after the command, e.g.:  fuse.bat --all
 rem ============================================================================
@@ -13,5 +13,5 @@ if errorlevel 1 (
     exit /b 1
 )
 
-uv run "%~dp0hugin.py" fuse %*
+uv run "%~dp0hugin_tools.py" fuse %*
 exit /b %errorlevel%

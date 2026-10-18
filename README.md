@@ -1,8 +1,8 @@
 # hugin-tools
 
 Two Hugin command-line workflows — **Fuse** (align and fuse a frame stack to
-reduce noise) and **Pano** (stitch a panorama) — behind one `hugin` command,
-sharing a common core (`hugintools/`).
+reduce noise) and **Pano** (stitch a panorama) — behind one `hugin_tools`
+command, sharing a common core (`hugin_tools/`).
 
 ## Requirements
 
@@ -17,23 +17,23 @@ sharing a common core (`hugintools/`).
 ## Usage
 
 ```
-uv run hugin.py fuse [options]     # or:  hugin.bat fuse [options]
-uv run hugin.py pano [options]     # or:  hugin.bat pano [options]
+uv run hugin_tools.py fuse [options]     # or:  hugin_tools.bat fuse [options]
+uv run hugin_tools.py pano [options]     # or:  hugin_tools.bat pano [options]
 ```
 
-`fuse.bat` and `pano.bat` remain as shims (`hugin fuse` / `hugin pano`), so old
-habits keep working. The command comes first; its options follow.
+`fuse.bat` and `pano.bat` remain as shims (`hugin_tools fuse` / `hugin_tools
+pano`), so old habits keep working. The command comes first; its options follow.
 
 Run from the folder holding your images, or name them via `-i`/`-o`:
 
 ```
-hugin.bat fuse --all
-hugin.bat fuse --aligner all -i "D:\export" -o "D:\out"
-hugin.bat pano -d
+hugin_tools.bat fuse --all
+hugin_tools.bat fuse --aligner all -i "D:\export" -o "D:\out"
+hugin_tools.bat pano -d
 ```
 
-See `uv run hugin.py fuse --help` and `uv run hugin.py pano --help` for the full
-option lists.
+See `uv run hugin_tools.py fuse --help` and `uv run hugin_tools.py pano --help`
+for the full option lists.
 
 ## Shared options
 
@@ -81,7 +81,8 @@ succeeded or failed. Keep it to inspect or to resume:
 
 The two scripts were merged into one command with a shared core:
 
-- `fuse.py` → `hugin fuse`, `pano.py` → `hugin pano` (the `.bat` shims cover this)
+- `fuse.py` → `hugin_tools fuse`, `pano.py` → `hugin_tools pano` (the `.bat`
+  shims cover this)
 - `--masks` (Fuse) and `--line-overlays` (Pano) are now the shared `--overlays`
 - intermediates moved from the output folder into `<outdir>/.hugin_tools`
   (Pano's numbered `.pto` files included), swept unless kept

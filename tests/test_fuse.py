@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from hugintools import fuse
+from hugin_tools import fuse
 
 
 def make_args(argv, overlays_on=False):

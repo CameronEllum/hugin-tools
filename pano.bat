@@ -1,7 +1,7 @@
 @echo off
 rem ============================================================================
-rem  pano.bat - shim: run `hugin pano`.  Kept so existing habits keep working;
-rem  see hugin.bat for the full command.
+rem  pano.bat - shim: run `hugin_tools pano`.  Kept so existing habits keep
+rem  working; see hugin_tools.bat for the full command.
 rem
 rem  Options go after the command, e.g.:  pano.bat -d
 rem ============================================================================
@@ -13,5 +13,5 @@ if errorlevel 1 (
     exit /b 1
 )
 
-uv run "%~dp0hugin.py" pano %*
+uv run "%~dp0hugin_tools.py" pano %*
 exit /b %errorlevel%

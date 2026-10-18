@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from hugintools import core
+from hugin_tools import core
 
 
 def test_collect_frames_folder(tmp_path):
