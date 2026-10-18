@@ -37,6 +37,11 @@ Alignment engines
     ais    : align_image_stack, non-default (full-res, dense, translation) [default]
     manual : Hugin cpfind -> cpclean -> autooptimiser -> nona remap
     all    : run manual into <outdir>/manual and ais into <outdir>/ais
+
+align_image_stack aligns in place and cannot pad or rescale, so every frame must
+have the same pixel size; mixed crops (e.g. one frame straightened in the raw
+editor) are refused up front.  The manual engine remaps each frame onto a common
+canvas and handles mixed sizes, so use that when the frames are not identical.
 """
 
 import argparse
@@ -294,6 +299,132 @@ def collect_frames(source: Path) -> tuple[list[Path], list[Path]]:
     if not frames:
         raise SystemExit(f"No source frames ({', '.join(sorted(IMAGE_EXTS))}) found in: {source}")
     return frames, skipped
+
+
+# ---------------------------------------------------------------------------
+#  Frame geometry (read from the file header - no image library needed)
+# ---------------------------------------------------------------------------
+def _jpeg_size(fh) -> tuple[int, int] | None:
+    """Width/height from a JPEG's start-of-frame marker."""
+    fh.seek(2)
+    while True:
+        byte = fh.read(1)
+        if not byte:
+            return None
+        if byte != b"\xff":
+            continue
+        code = fh.read(1)
+        while code == b"\xff":  # fill bytes between segments
+            code = fh.read(1)
+        if not code:
+            return None
+        marker = code[0]
+        if marker in (0x00, 0x01) or 0xD0 <= marker <= 0xD9:  # padding / restarts
+            continue
+        raw = fh.read(2)
+        if len(raw) < 2:
+            return None
+        length = int.from_bytes(raw, "big")
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            data = fh.read(5)  # precision, height, width
+            if len(data) < 5:
+                return None
+            return int.from_bytes(data[3:5], "big"), int.from_bytes(data[1:3], "big")
+        if marker == 0xDA:  # start of scan, so there was no frame header
+            return None
+        if length < 2:
+            return None
+        fh.seek(length - 2, 1)
+
+
+def _tiff_size(fh) -> tuple[int, int] | None:
+    """Width/height from a TIFF's first image file directory, SubIFDs included."""
+    fh.seek(0)
+    head = fh.read(8)
+    if len(head) < 8:
+        return None
+    endian = "little" if head[:2] == b"II" else "big"
+    if int.from_bytes(head[2:4], endian) != 42:
+        return None
+
+    queue = [int.from_bytes(head[4:8], endian)]
+    seen: set[int] = set()
+    while queue:
+        offset = queue.pop(0)
+        if not offset or offset in seen:
+            continue
+        seen.add(offset)
+        fh.seek(offset)
+        raw = fh.read(2)
+        if len(raw) < 2:
+            continue
+        count = int.from_bytes(raw, endian)
+        blob = fh.read(12 * count)
+        values: dict[int, int] = {}
+        for i in range(count):
+            entry = blob[i * 12 : i * 12 + 12]
+            if len(entry) < 12:
+                break
+            tag = int.from_bytes(entry[0:2], endian)
+            typ = int.from_bytes(entry[2:4], endian)
+            num = int.from_bytes(entry[4:8], endian)
+            size = {1: 1, 3: 2, 4: 4}.get(typ, 0)  # BYTE / SHORT / LONG
+            if not size or not num:
+                continue
+            if size * num <= 4:  # value fits inline, left-justified
+                values[tag] = int.from_bytes(entry[8 : 8 + size], endian)
+            else:
+                back = fh.tell()
+                fh.seek(int.from_bytes(entry[8:12], endian))
+                values[tag] = int.from_bytes(fh.read(size), endian)
+                fh.seek(back)
+            if tag == 330:  # SubIFDs: raw-ish files keep the size there
+                queue.append(values[tag])
+        if 256 in values and 257 in values:  # ImageWidth / ImageLength
+            return values[256], values[257]
+    return None
+
+
+def frame_size(path: Path) -> tuple[int, int] | None:
+    """Pixel dimensions from an image file's header, or None if unrecognised."""
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(8)
+            if head == b"\x89PNG\r\n\x1a\n":
+                fh.seek(16)
+                data = fh.read(8)
+                if len(data) < 8:
+                    return None
+                return int.from_bytes(data[:4], "big"), int.from_bytes(data[4:8], "big")
+            if head[:2] == b"\xff\xd8":
+                return _jpeg_size(fh)
+            if head[:2] in (b"II", b"MM"):
+                return _tiff_size(fh)
+    except OSError:
+        return None
+    return None
+
+
+def check_same_size(frames: list[Path]) -> None:
+    """Refuse a frame stack of mixed pixel sizes before ais is asked to align it.
+
+    align_image_stack works in place and has no way to pad or rescale, so it
+    fails with 'images have different sizes'. Frames that were cropped or
+    straightened differently on export hit this, and the tool's own error is
+    easy to miss - so list the sizes and point at the engine that can cope.
+    Unknown sizes (an exotic format) are left to ais to complain about.
+    """
+    sizes = [(p, frame_size(p)) for p in frames]
+    if any(s is None for _, s in sizes) or len({s for _, s in sizes}) == 1:
+        return
+    listing = "\n".join(f"    {p.name}  {w} x {h}" for p, (w, h) in sizes)
+    raise SystemExit(
+        f"Frames have different pixel sizes:\n{listing}\n"
+        "align_image_stack (the default 'ais' aligner) aligns in place and needs every\n"
+        "frame to be the same size - it cannot pad or rescale.\n"
+        "Re-export the frames with identical crops and straightening, or run with\n"
+        "--aligner manual, which remaps mixed sizes onto one canvas."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -912,6 +1043,11 @@ def main() -> int:
         outdir = Path(args.outdir) if args.outdir else Path(".")
 
         frames, skipped = collect_frames(source)
+
+        # ais aligns in place and cannot pad or rescale, so a stack of mixed
+        # sizes would die deep inside align_image_stack - refuse it up front.
+        if args.aligner in ("ais", "all"):
+            check_same_size(frames)
 
         extra: list[str] = []
         if skipped:
